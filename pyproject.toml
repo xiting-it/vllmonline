@@ -135,7 +135,7 @@ target-version = "py312"
 line-length = 100
 # 不动用户的输入文档；不碰 alembic 自动生成的版本文件
 extend-exclude = [
-    "alembic/versions",
+    "alembic",  # alembic 自动生成的 migration 不归我们 lint
     "scripts/reports",
     "SPEC.md",
     "PLAN.md",

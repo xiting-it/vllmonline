@@ -160,9 +160,12 @@ def postgres_url() -> str | None:
     通过 lazy + skip 实现：测试内部用 `request.getfixturevalue("postgres_url")`。
     """
     try:
-        from testcontainers.postgres import PostgresContainer
+        from testcontainers.community.postgres import PostgresContainer
     except ImportError:
-        pytest.skip("testcontainers 未安装；用 `uv sync --group test` 安装")
+        try:
+            from testcontainers.postgres import PostgresContainer  # type: ignore[assignment]
+        except ImportError:
+            pytest.skip("testcontainers 未安装；用 `uv sync --group test` 安装")
 
     # pgvector image（SPEC §11.1 用 pgvector/pgvector:pg16）
     with PostgresContainer("pgvector/pgvector:pg16", driver="asyncpg") as pg:

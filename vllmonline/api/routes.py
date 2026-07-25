@@ -25,12 +25,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from vllmonline.api.schemas import (
+    CanaryStartRequest,
     EvalCompareRequest,
     ModelListResponse,
     ModelRegisterRequest,
     ModelResponse,
 )
-from vllmonline.db.models import EvalResult, ModelVersion
+from vllmonline.db.models import CanaryDeployment, CanaryEvent, EvalResult, ModelVersion
 from vllmonline.db.session import get_session
 from vllmonline.scheduler.gpu_memory import build_model_profile
 from vllmonline.scheduler.lifecycle import Model, ModelRegistry
@@ -473,3 +474,190 @@ def create_eval_router() -> APIRouter:
 def register_eval_routes(app: object) -> None:
     """挂载评测路由。"""
     app.include_router(create_eval_router())  # type: ignore[attr-defined]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 灰度管理路由（P3/P5，SPEC §8.2 灰度部分）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def create_canary_router() -> APIRouter:
+    """构造灰度管理路由（start/status/advance/rollback/metrics）。"""
+    router = APIRouter(prefix="/api/canary", tags=["canary"])
+
+    @router.post("/start", status_code=status.HTTP_201_CREATED)
+    async def start_canary(
+        req: CanaryStartRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        """启动灰度发布（SPEC §8.3）。"""
+        from vllmonline.canary.strategy import CanaryStage, GrayStrategy
+        from vllmonline.config import get_settings
+        from vllmonline.router.proxy import get_routing_manager
+
+        registry = get_registry()
+        if req.model_v1 not in registry or req.model_v2 not in registry:
+            msg = f"模型 {req.model_v1} 或 {req.model_v2} 未注册"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+
+        m1 = registry.get(req.model_v1)
+        m2 = registry.get(req.model_v2)
+        if m1.state is not ModelState.ACTIVE:
+            msg = f"{req.model_v1} 必须 ACTIVE 才能作为 baseline"
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg)
+        if m2.state is not ModelState.ACTIVE:
+            msg = f"{req.model_v2} 必须 ACTIVE 才能作为候选版本"
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg)
+
+        strategy = GrayStrategy(get_settings().canary)
+        stage = strategy.stage_from_index(req.stages, 0)
+        split = strategy.get_traffic_split(stage, req.model_v1, req.model_v2)
+
+        routing = get_routing_manager()
+        await routing.set_split(split)
+
+        import uuid
+
+        deployment_id = f"canary-{uuid.uuid4().hex[:12]}"
+        row = CanaryDeployment(
+            id=deployment_id,
+            model_v1_id=req.model_v1,
+            model_v2_id=req.model_v2,
+            strategy=req.strategy,
+            stages=req.stages,
+            current_stage_index=0,
+            traffic_split=split,
+            status="IN_PROGRESS",
+        )
+        session.add(row)
+        await session.commit()
+
+        stage_name = strategy.next_stage(CanaryStage.INIT) or CanaryStage.STAGE_10
+        return {
+            "id": deployment_id,
+            "current_stage": stage_name.value,
+            "traffic_split": split,
+        }
+
+    @router.get("/{deployment_id}/status")
+    async def canary_status(
+        deployment_id: str,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        row = await session.get(CanaryDeployment, deployment_id)
+        if row is None:
+            msg = f"灰度部署 {deployment_id} 不存在"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        from vllmonline.canary.strategy import GrayStrategy
+        from vllmonline.config import get_settings
+
+        strategy = GrayStrategy(get_settings().canary)
+        stage = strategy.stage_from_index(row.stages, row.current_stage_index)
+        return {
+            "id": row.id,
+            "current_stage": stage.value,
+            "traffic_split": row.traffic_split or {},
+            "status": row.status,
+            "stage_index": row.current_stage_index,
+            "stages": row.stages,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+        }
+
+    @router.post("/{deployment_id}/advance")
+    async def advance_canary(
+        deployment_id: str,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        row = await session.get(CanaryDeployment, deployment_id)
+        if row is None:
+            msg = f"灰度部署 {deployment_id} 不存在"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        if row.status != "IN_PROGRESS":
+            msg = f"部署 {deployment_id} 状态 {row.status}，无法推进"
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg)
+
+        from vllmonline.canary.strategy import GrayStrategy
+        from vllmonline.config import get_settings
+        from vllmonline.router.proxy import get_routing_manager
+
+        strategy = GrayStrategy(get_settings().canary)
+        next_idx = row.current_stage_index + 1
+        if next_idx >= len(row.stages):
+            row.status = "COMPLETED"
+            await session.commit()
+            return {"id": row.id, "current_stage": "COMPLETED", "advanced": False}
+
+        new_stage = strategy.stage_from_index(row.stages, next_idx)
+        new_split = strategy.get_traffic_split(new_stage, row.model_v1_id, row.model_v2_id)
+        row.current_stage_index = next_idx
+        row.traffic_split = new_split
+        await session.commit()
+
+        routing = get_routing_manager()
+        await routing.set_split(new_split)
+
+        session.add(
+            CanaryEvent(
+                deployment_id=row.id,
+                stage_index=next_idx,
+                action="ADVANCE",
+                reason=f"手动推进到 {new_stage.value}",
+            )
+        )
+        await session.commit()
+        return {
+            "id": row.id,
+            "current_stage": new_stage.value,
+            "traffic_split": new_split,
+            "advanced": True,
+        }
+
+    @router.post("/{deployment_id}/rollback")
+    async def rollback_canary(
+        deployment_id: str,
+        reason: str = "manual rollback",
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        row = await session.get(CanaryDeployment, deployment_id)
+        if row is None:
+            msg = f"灰度部署 {deployment_id} 不存在"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        if row.status != "IN_PROGRESS":
+            msg = f"部署 {deployment_id} 状态 {row.status}，无法回滚"
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg)
+
+        from vllmonline.canary.rollback import RollbackExecutor
+        from vllmonline.router.proxy import get_routing_manager
+
+        registry = get_registry()
+        executor = RollbackExecutor(registry, get_routing_manager())
+        await executor.execute_rollback(
+            deployment=row,
+            v1_id=row.model_v1_id,
+            v2_id=row.model_v2_id,
+            reason=reason,
+            session=session,
+        )
+        return {"id": row.id, "status": "ROLLED_BACK", "reason": reason}
+
+    @router.get("/{deployment_id}/metrics")
+    async def canary_metrics(
+        deployment_id: str,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        row = await session.get(CanaryDeployment, deployment_id)
+        if row is None:
+            msg = f"灰度部署 {deployment_id} 不存在"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        return {
+            "id": row.id,
+            "traffic_split": row.traffic_split or {},
+            "note": "per-version metrics 需 Prometheus 接入后填充",
+        }
+
+    return router
+
+
+def register_canary_routes(app: object) -> None:
+    """挂载灰度路由。"""
+    app.include_router(create_canary_router())  # type: ignore[attr-defined]
