@@ -78,6 +78,10 @@ async def vllmonline_app(fake_vllm_app: Any) -> Any:
         yield server.create_app()
     finally:
         server.clear_test_backend()
+        # 清理全局单例（避免测试间状态污染）
+        import vllmonline.router.proxy as proxy_mod
+
+        proxy_mod._global_routing_manager = None  # type: ignore[attr-defined]
 
 
 @pytest.fixture

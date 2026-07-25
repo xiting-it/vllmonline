@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from vllmonline.config import Settings, get_settings
-from vllmonline.metrics import REGISTRY, init_metrics, record_proxy_request
+from vllmonline.metrics import REGISTRY, init_metrics
 from vllmonline.version import __version__
 
 # hop-by-hop headers 不应被代理转发（RFC 7230 §6.1）
@@ -161,6 +161,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = ModelRegistry()
     api_routes.set_global_registry(registry)
     state.registry = registry
+
+    # P3：初始化路由表管理器
+    from vllmonline.router.proxy import RoutingTableManager, set_global_routing_manager
+
+    routing_manager = RoutingTableManager(registry)
+    set_global_routing_manager(routing_manager)
 
     logger.info(
         "vllmonline starting",
@@ -314,29 +320,59 @@ async def proxy_chat_completion(
 ) -> Response:
     """POST /v1/chat/completions —— OpenAI 兼容代理。
 
-    Phase 0 行为：透传请求体到默认 vLLM backend，streaming 逐 chunk 透传。
-    不修改请求体，不注入额外 header（P3 起加 x-model-version）。
+    P3 行为：
+        1. 读请求体 model 字段
+        2. 通过 RoutingTableManager 加权选版本
+        3. 注入 x-model-version header
+        4. 转发 + 采集 per-request metrics（TTFT/TPOT/throughput）
+        5. streaming 逐 chunk 透传
+
+    无 ACTIVE 版本时回退到默认 backend（向后兼容 P0）。
     """
     body = await request.body()
 
-    # 检测是否 streaming 请求（保守：解析失败按非 streaming 处理）
     try:
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
     is_stream = bool(payload.get("stream", False))
+    model_name = payload.get("model", "")
 
     # 透传 header（去掉 hop-by-hop）
     forwarded_headers = {
         k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS
     }
 
-    backend_url = f"{state.default_backend_url}/v1/chat/completions"
+    # P3：通过路由表选版本
+    backend_url: str
+    model_version = "unknown"
+    try:
+        from vllmonline.router.proxy import get_routing_manager
+
+        manager = get_routing_manager()
+        decision = manager.select(model_name)
+        backend_url = f"{decision.endpoint.rstrip('/')}/v1/chat/completions"
+        model_version = decision.model_version
+        forwarded_headers["x-model-version"] = model_version
+        state.logger.debug(
+            "routed",
+            model=model_name,
+            version=model_version,
+            endpoint=decision.endpoint,
+        )
+    except Exception:
+        # 回退到默认 backend（无路由表 / 无 ACTIVE 版本）
+        backend_url = f"{state.default_backend_url}/v1/chat/completions"
+
     client = state.http_client
 
     if is_stream:
-        return await _proxy_stream(client, backend_url, body, forwarded_headers, state)
-    return await _proxy_nonstream(client, backend_url, body, forwarded_headers, state)
+        return await _proxy_stream(
+            client, backend_url, body, forwarded_headers, state, model_version
+        )
+    return await _proxy_nonstream(
+        client, backend_url, body, forwarded_headers, state, model_version
+    )
 
 
 async def _proxy_nonstream(
@@ -345,22 +381,27 @@ async def _proxy_nonstream(
     body: bytes,
     headers: dict[str, str],
     state: AppState,
+    model_version: str = "unknown",
 ) -> JSONResponse:
     """非 streaming：等完整响应后返回。"""
+    from vllmonline.router.middleware import RequestMetrics
+
+    metrics = RequestMetrics(model_version=model_version)
+    metrics.start()
     try:
         resp = await client.post(url, content=body, headers=headers)
     except httpx.HTTPError as e:
         state.logger.error("proxy upstream error", url=url, error=str(e))
-        record_proxy_request(status="error", error_type="upstream_unreachable")
+        metrics.on_error("upstream_unreachable")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"upstream vLLM unreachable: {e}",
         ) from e
 
-    record_proxy_request(
-        status="success" if resp.is_success else "error",
-        error_type=None if resp.is_success else f"http_{resp.status_code}",
-    )
+    if resp.is_success:
+        metrics.on_success()
+    else:
+        metrics.on_error(f"http_{resp.status_code}")
     return JSONResponse(
         content=resp.json() if resp.content else {},
         status_code=resp.status_code,
@@ -373,25 +414,24 @@ async def _proxy_stream(
     body: bytes,
     headers: dict[str, str],
     state: AppState,
+    model_version: str = "unknown",
 ) -> StreamingResponse:
-    """streaming：逐 chunk 透传（保持 SSE 不变形）。"""
+    """streaming：逐 chunk 透传 + 采集 TTFT/TPOT metrics。"""
+    from vllmonline.router.middleware import RequestMetrics, instrument_stream
+
     headers = {**headers, "accept": "text/event-stream"}
+    metrics = RequestMetrics(model_version=model_version)
+    metrics.start()
 
     async def chunk_generator() -> AsyncIterator[bytes]:
-        ok = True
         try:
             async with client.stream("POST", url, content=body, headers=headers) as upstream:
-                async for chunk in upstream.aiter_raw():
-                    if chunk:
-                        yield chunk
+                # 包装 upstream chunk 流，解析 SSE 采集 metrics
+                async for chunk in instrument_stream(upstream.aiter_raw(), metrics):
+                    yield chunk
         except httpx.HTTPError as e:
-            ok = False
+            metrics.on_error("stream_error")
             state.logger.error("proxy stream error", url=url, error=str(e))
-        finally:
-            record_proxy_request(
-                status="success" if ok else "error",
-                error_type=None if ok else "stream_error",
-            )
 
     return StreamingResponse(chunk_generator(), media_type="text/event-stream")
 
