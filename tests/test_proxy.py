@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+import pytest
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 
@@ -62,21 +63,39 @@ async def test_readyz_with_fake_backend(client: AsyncClient) -> None:
     assert body["checks"]["vllm"] == "ok"
 
 
-async def test_readyz_when_backend_down() -> None:
-    """readyz 失败——backend 不可达。"""
+async def test_readyz_when_backend_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """readyz 失败——backend 不可达。
+
+    直接 mock http_client.get 抛 ConnectError，避免依赖真实网络行为
+    （不同环境下"不可达地址"的表现不一致：可能超时、可能 ConnectionRefused、
+    也可能被本地代理拦截返回 502）。
+    """
     from vllmonline import server
     from vllmonline.config import get_settings
 
     get_settings.cache_clear()
 
-    # 注入一个指向不可达端口的 client（用短超时加速失败）
+    # 构造一个 fake vLLM，但 monkeypatch 它的 /health 路由让 client.get 抛异常
+    fake_app = make_fake_vllm_app()
+
     server.set_test_backend(
         client_factory=lambda: AsyncClient(
-            base_url="http://127.0.0.1:1",  # 1 号端口：几乎肯定没服务
-            timeout=httpx.Timeout(0.5),
+            transport=ASGITransport(app=fake_app),
+            base_url="http://fake-vllm",
         ),
-        backend_url="http://127.0.0.1:1",
+        backend_url="http://fake-vllm",
     )
+
+    # 让 httpx 在 GET /health 时抛 ConnectError
+    original_get = httpx.AsyncClient.get
+
+    async def failing_get(self, url, **kwargs):
+        if "/health" in str(url):
+            raise httpx.ConnectError("mocked unreachable")
+        return await original_get(self, url, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", failing_get)
+
     try:
         app = server.create_app()
         async with app_client(app) as ac:

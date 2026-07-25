@@ -1,0 +1,127 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "请求总数（按版本）",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (model_version) (increase(vllmonline_requests_total[5m]))",
+          "legendFormat": "{{model_version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "req"}
+      }
+    },
+    {
+      "title": "错误率（按版本）",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (model_version) (rate(vllmonline_errors_total[5m])) / sum by (model_version) (rate(vllmonline_requests_total[5m]))",
+          "legendFormat": "{{model_version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "percentunit", "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 0.02}]}}
+      }
+    },
+    {
+      "title": "在飞请求数（按版本）",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "vllmonline_requests_in_flight",
+          "legendFormat": "{{model_version}}"
+        }
+      ]
+    },
+    {
+      "title": "吞吐量 tokens/s（按版本）",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "expr": "vllmonline_throughput_tokens_per_second",
+          "legendFormat": "{{model_version}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "cps"}}
+    },
+    {
+      "title": "TTFT 分布（v1 vs v2）",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 6},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model_version) (rate(vllmonline_ttft_seconds_bucket[5m])))",
+          "legendFormat": "P50 {{model_version}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model_version) (rate(vllmonline_ttft_seconds_bucket[5m])))",
+          "legendFormat": "P99 {{model_version}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}}
+    },
+    {
+      "title": "TPOT 分布（v1 vs v2）",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 6},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model_version) (rate(vllmonline_tpot_seconds_bucket[5m])))",
+          "legendFormat": "P50 {{model_version}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model_version) (rate(vllmonline_tpot_seconds_bucket[5m])))",
+          "legendFormat": "P99 {{model_version}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "title": "请求速率（成功 vs 错误，按版本）",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "sum by (model_version, status) (rate(vllmonline_requests_total[5m]))",
+          "legendFormat": "{{model_version}} {{status}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["vllmonline", "vllm", "canary"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "vLLMonline - 灰度对比仪表盘",
+  "uid": "vllmonline",
+  "version": 1,
+  "weekStart": ""
+}
