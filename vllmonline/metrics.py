@@ -12,12 +12,13 @@ CPU-only 的快速字典更新，不会阻塞）。
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram, Registry, get_default_registry
+from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client.registry import REGISTRY as _DEFAULT_REGISTRY
+from prometheus_client.registry import CollectorRegistry
 
-# 用一个独立 Registry，方便测试时隔离（避免全局污染）。
-# 生产里我们其实用默认 registry（这样 /metrics 端点能自动 expose）。
-# 这里保留 REGISTRY 作为对外名字，测试时 monkeypatch 可换。
-REGISTRY: Registry = get_default_registry()
+# 用默认全局 registry（这样 /metrics 端点能自动 expose）。
+# 测试如需隔离可 monkeypatch 本模块的 REGISTRY 为独立 CollectorRegistry。
+REGISTRY: CollectorRegistry = _DEFAULT_REGISTRY
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Metric 定义（模块级单例）

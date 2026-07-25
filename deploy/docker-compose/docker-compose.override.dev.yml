@@ -1,0 +1,50 @@
+# 开发环境 override：无 GPU 时把 vLLM 替换为 fake server。
+#
+# 用法：make compose-up-dev
+#   等价于：docker compose -f docker-compose.yml -f docker-compose.override.dev.yml up -d
+#
+# 这个 override 文件做两件事：
+#   1. 把 vllm-v1 服务从 rocm/vllm 镜像换成 vllmonline 自身镜像跑的 fake 模式
+#   2. 关闭所有 device 挂载（无 GPU 不需要）
+#
+# fake vllm 行为：模拟 OpenAI 兼容 API（含 streaming）+ /sleep /wake_up /metrics，
+# 完全 CPU 运行，方便在 macOS / 无 GPU CI 上演示完整流程。
+
+services:
+  vllm-v1:
+    # 用 vllmonline 自身镜像，但覆盖 command 跑 fake server
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile
+    image: vllmonline:latest
+    container_name: vllm-v1-fake
+    # 入口：用 python -m 跑 fake server（tests/fake_vllm.py 的 main）
+    command: >
+      python -c "
+      import uvicorn
+      from tests.fake_vllm import make_fake_vllm_app
+      uvicorn.run(make_fake_vllm_app(model_name='qwen-7b'),
+                  host='0.0.0.0', port=8000, log_level='info')
+      "
+    # 覆盖掉生产 override 里的 GPU 挂载
+    devices: !reset []
+    device_cgroup_rules: !reset []
+    cap_add: !reset []
+    security_opt: !reset []
+    group_add: !reset []
+    ipc: !reset null
+    shm_size: !reset null
+    environment:
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # 开发环境降低 vllmonline 的内存占用
+  vllmonline:
+    environment:
+      VLLMONLINE_ENVIRONMENT: development
+      VLLMONLINE_LOGGING__JSON_FORMAT: "false"

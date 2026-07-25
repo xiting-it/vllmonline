@@ -10,12 +10,28 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
-import pytest
+from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 
 from tests.fake_vllm import make_fake_vllm_app
+
+
+@asynccontextmanager
+async def app_client(
+    app: Any,
+    *,
+    base_url: str = "http://test",
+) -> AsyncIterator[AsyncClient]:
+    """驱动 FastAPI lifespan 并返回 ASGITransport client 的辅助上下文。"""
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url=base_url) as ac:
+            yield ac
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,35 +62,28 @@ async def test_readyz_with_fake_backend(client: AsyncClient) -> None:
     assert body["checks"]["vllm"] == "ok"
 
 
-async def test_readyz_when_backend_down(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_readyz_when_backend_down() -> None:
     """readyz 失败——backend 不可达。"""
     from vllmonline import server
     from vllmonline.config import get_settings
 
     get_settings.cache_clear()
 
-    app = server.create_app()
+    # 注入一个指向不可达端口的 client（用短超时加速失败）
+    server.set_test_backend(
+        client_factory=lambda: AsyncClient(
+            base_url="http://127.0.0.1:1",  # 1 号端口：几乎肯定没服务
+            timeout=httpx.Timeout(0.5),
+        ),
+        backend_url="http://127.0.0.1:1",
+    )
+    try:
+        app = server.create_app()
+        async with app_client(app) as ac:
+            r = await ac.get("/readyz")
+    finally:
+        server.clear_test_backend()
 
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def _lifespan_with_dead_backend(a):  # type: ignore[no-untyped-def]
-        async with app.router.lifespan_context(a):
-            state = server.AppState.from_app(a)
-            await state.http_client.aclose()
-            # 指向一个必然不可达的端口
-            state.http_client = AsyncClient(
-                transport=httpx.HTTPTransport(),
-                base_url="http://127.0.0.1:1",  # 1 号端口：几乎肯定没服务
-            )
-            state.default_backend_url = "http://127.0.0.1:1"
-            yield
-
-    app.router.lifespan_context = _lifespan_with_dead_backend  # type: ignore[method-assign]
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        r = await ac.get("/readyz")
     assert r.status_code == 503
     body = r.json()
     assert body["status"] == "not_ready"
@@ -152,38 +161,31 @@ async def test_proxy_preserves_model_field(client: AsyncClient) -> None:
     assert r.json()["model"] == "my-custom-model-name"
 
 
-async def test_proxy_returns_502_on_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_proxy_returns_502_on_upstream_error() -> None:
     """upstream 返回 500 时，proxy 把状态透传（不吞掉）。"""
     # 用一个会主动失败的 fake
     failing_fake = make_fake_vllm_app(error_rate=1.0)  # 100% 失败
 
     from vllmonline import server
     from vllmonline.config import get_settings
-    from contextlib import asynccontextmanager
 
     get_settings.cache_clear()
-    app = server.create_app()
-
-    @asynccontextmanager
-    async def _lifespan(a):  # type: ignore[no-untyped-def]
-        async with app.router.lifespan_context(a):
-            state = server.AppState.from_app(a)
-            await state.http_client.aclose()
-            state.http_client = AsyncClient(
-                transport=ASGITransport(app=failing_fake),
-                base_url="http://fake-vllm",
+    server.set_test_backend(
+        client_factory=lambda: AsyncClient(
+            transport=ASGITransport(app=failing_fake),
+            base_url="http://fake-vllm",
+        ),
+        backend_url="http://fake-vllm",
+    )
+    try:
+        app = server.create_app()
+        async with app_client(app) as ac:
+            r = await ac.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
             )
-            state.default_backend_url = "http://fake-vllm"
-            yield
-
-    app.router.lifespan_context = _lifespan  # type: ignore[method-assign]
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        r = await ac.post(
-            "/v1/chat/completions",
-            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
-        )
+    finally:
+        server.clear_test_backend()
     assert r.status_code == 500
 
 

@@ -72,6 +72,7 @@ dev = [
     "types-pyyaml>=6.0",
 ]
 test = [
+    "asgi-lifespan>=2.1.0",
     "pytest>=8.3,<10",
     "pytest-asyncio>=0.24,<0.30",
     "pytest-cov>=6.0,<8",
@@ -130,7 +131,14 @@ filterwarnings = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-extend-exclude = ["alembic/versions", "scripts/reports"]
+# 不动用户的输入文档；不碰 alembic 自动生成的版本文件
+extend-exclude = [
+    "alembic/versions",
+    "scripts/reports",
+    "SPEC.md",
+    "PLAN.md",
+    "*.md",  # ruff 主要管 Python；md 偶尔会被 format 误改（如表格）
+]
 
 [tool.ruff.lint]
 # 规则集：
@@ -139,11 +147,18 @@ extend-exclude = ["alembic/versions", "scripts/reports"]
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
 ignore = [
     "E501",  # 行长由 formatter 管
+    # 中文注释/文档里全角标点（；（）等）是正常的，不算错误
+    "RUF001",  # ambiguous unicode char in string
+    "RUF002",  # ambiguous unicode char in docstring
+    "RUF003",  # ambiguous unicode char in comment
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ASYNC"]  # 测试里 ASYNC 误报多（同步 fixture 调 async）
 "tests/fake_vllm.py" = ["B008"]  # FastAPI 路由函数式定义
+# FastAPI 项目里 Depends() / Field() 在默认参数是标准用法，不是 bug
+"vllmonline/server.py" = ["B008"]
+"vllmonline/api/*" = ["B008"]
 
 [tool.ruff.format]
 quote-style = "double"

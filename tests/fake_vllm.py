@@ -176,7 +176,9 @@ def make_fake_vllm_app(
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": i, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "choices": [
+                        {"index": i, "delta": {"role": "assistant"}, "finish_reason": None}
+                    ],
                 }
             )
             # content chunks
@@ -260,9 +262,7 @@ def _extract_prompt(body: dict[str, Any]) -> str:
     """从 chat 请求体提取 prompt 字符串（messages 拼接）。"""
     messages = body.get("messages", [])
     if isinstance(messages, list):
-        return " ".join(
-            m.get("content", "") if isinstance(m, dict) else str(m) for m in messages
-        )
+        return " ".join(m.get("content", "") if isinstance(m, dict) else str(m) for m in messages)
     return str(messages)
 
 

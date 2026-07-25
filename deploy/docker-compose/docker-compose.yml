@@ -1,0 +1,184 @@
+# vLLMonline 全栈部署（MI300X 生产配置）
+#
+# 启动：make compose-up
+# 停止：make compose-down
+#
+# 前置条件（MI300X 宿主机）：
+#   - 已安装 ROCm 7.2.1+ 驱动（rocm-smi 可用）
+#   - Docker + nvidia-container-toolkit 的 AMD 等价物（rocm-smi 在容器内可见）
+#   - /dev/kfd 和 /dev/dri 设备存在
+#
+# 无 GPU 的开发环境：用 docker-compose.override.dev.yml（make compose-up-dev）
+
+services:
+  # ─── vLLMonline 平台本体 ──────────────────────────────────────────────────
+  vllmonline:
+    build:
+      context: ../..
+      dockerfile: deploy/docker-compose/Dockerfile
+    image: vllmonline:latest
+    container_name: vllmonline
+    ports:
+      - "8080:8080"
+    environment:
+      VLLMONLINE_ENVIRONMENT: production
+      VLLMONLINE_LOGGING__JSON_FORMAT: "true"
+      VLLMONLINE_LOGGING__LEVEL: INFO
+      VLLMONLINE_DATABASE__URL: postgresql+asyncpg://vllmonline:vllmonline@postgres:5432/vllmonline
+      VLLMONLINE_REDIS__URL: redis://redis:6379/0
+      VLLMONLINE_GPU__BACKEND: rocm
+      # MI300X 推荐：HBM stack + ROCm runtime 比 NVIDIA 的 CUDA context 大
+      VLLMONLINE_GPU__CUDA_CONTEXT_OVERHEAD_GB: "4.0"
+      # Phase 0：默认 backend 指向同 compose 的 vLLM 服务
+      VLLM_BACKEND_URL: http://vllm-v1:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+  # ─── vLLM backend v1（稳定版本）──────────────────────────────────────────
+  # 用 AMD 官方 ROCm 镜像，MI300X (gfx942) 原生支持。
+  vllm-v1:
+    image: rocm/vllm:ubuntu22.04-rocm7.2.1-py312-torch2.9.1-1.36.3
+    container_name: vllm-v1
+    command: >
+      --model Qwen/Qwen2.5-7B-Instruct
+      --served-model-name qwen-7b
+      --port 8000
+      --gpu-memory-utilization 0.40
+      --max-model-len 8192
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    device_cgroup_rules:
+      - "c 5:* rmw"
+      - "c 226:* rmw"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    group_add:
+      - video
+      - render
+    ipc: host
+    shm_size: 16G
+    environment:
+      # MI300X 原生支持 gfx942，无需 HSA_OVERRIDE_GFX_VERSION
+      HSA_ENABLE_SDMA: "0"
+      # PyTorch TunableOp（AMD 官方对 vLLM 推荐，镜像默认开）
+      PYTORCH_TUNABLEOP_VERBOSE: "0"
+      PYTORCH_TUNABLEOP_TUNING: "1"
+      PYTORCH_TUNABLEOP_MAX_TUNING_COUNT: "100"
+      PYTORCH_TUNABLEOP_MATMUL_ADD_BMM: "1"
+      # 运行时 LoRA 加载（SPEC §7.1 需要）
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s  # 模型加载慢
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+  # ─── vLLM backend v2（候选版本，灰度时启用）──────────────────────────────
+  # 默认注释掉——按需启用（灰度发布时启动）。
+  # 启用后改 VLLM_BACKEND_URL 或通过 /api/canary/start 配置路由。
+  # vllm-v2:
+  #   image: rocm/vllm:ubuntu22.04-rocm7.2.1-py312-torch2.9.1-1.36.3
+  #   container_name: vllm-v2
+  #   command: >
+  #     --model Qwen/Qwen2.5-7B-Instruct-v2
+  #     --served-model-name qwen-7b
+  #     --port 8001
+  #     --gpu-memory-utilization 0.40
+  #   devices: [/dev/kfd, /dev/dri]
+  #   ...（同 v1）
+
+  # ─── PostgreSQL（带 pgvector，SPEC §11.1）─────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: vllmonline-postgres
+    environment:
+      POSTGRES_DB: vllmonline
+      POSTGRES_USER: vllmonline
+      POSTGRES_PASSWORD: vllmonline
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vllmonline"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+  # ─── Redis（路由表热更新 + metrics 缓存）──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: vllmonline-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+  # ─── Prometheus ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vllmonline-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - vllmonline
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+  # ─── Grafana ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vllmonline-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana-datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - vllmonline-net
+
+networks:
+  vllmonline-net:
+    driver: bridge
+
+volumes:
+  hf-cache:
+  pg-data:
+  redis-data:
+  prom-data:
+  grafana-data:

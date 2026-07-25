@@ -27,7 +27,7 @@ os.environ.setdefault("VLLMONLINE_DATABASE__URL", "sqlite+aiosqlite:///:memory:"
 os.environ.setdefault("VLLMONLINE_REDIS__ENABLED", "false")
 os.environ.setdefault("VLLMONLINE_LOGGING__LEVEL", "WARNING")
 
-from tests.fake_vllm import make_fake_vllm_app  # noqa: E402
+from tests.fake_vllm import make_fake_vllm_app
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fake vLLM backend
@@ -54,14 +54,11 @@ async def fake_vllm_client(fake_vllm_app: Any) -> AsyncIterator[AsyncClient]:
 
 
 @pytest.fixture
-async def vllmonline_app(monkeypatch: pytest.MonkeyPatch, fake_vllm_app: Any) -> Any:
+async def vllmonline_app(fake_vllm_app: Any) -> Any:
     """构造一个 vllmonline FastAPI app，其 backend 指向 fake vLLM。
 
-    通过 monkeypatch 替换 AppState.default_backend_url 的来源——
-    server.lifespan 读 VLLM_BACKEND_URL 环境变量，但 ASGITransport 不能用 URL。
-    解法：在 fake vLLM 上挂一个 base_url 标记，并 patch httpx 客户端的 transport。
-
-    更简单的做法：直接在 lifespan 里把 http_client 替换成指向 fake vllm 的 client。
+    通过 server.set_test_backend() 注入一个指向 fake vLLM 的 httpx client 工厂。
+    lifespan 启动时会读这个 hook，构建零网络的 ASGITransport client。
     """
     from vllmonline import server
     from vllmonline.config import get_settings
@@ -69,38 +66,33 @@ async def vllmonline_app(monkeypatch: pytest.MonkeyPatch, fake_vllm_app: Any) ->
     # 重置 settings 缓存，确保读到测试环境变量
     get_settings.cache_clear()
 
-    app = server.create_app()
+    # 注入测试 backend：每次 lifespan 调工厂时构造一个新的指向 fake 的 client
+    def _factory() -> AsyncClient:
+        return AsyncClient(
+            transport=ASGITransport(app=fake_vllm_app),
+            base_url="http://fake-vllm",
+        )
 
-    # 用 fake vllm transport 替换 http_client。
-    # lifespan 启动时会创建 http_client，我们 monkeypatch httpx.AsyncClient
-    # 让它使用 ASGITransport——但更干净的方式是 lifespan 后替换 app.state。
-    real_lifespan = app.router.lifespan_context
-
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def patched_lifespan(a: Any) -> AsyncIterator[None]:
-        async with real_lifespan(a):
-            state = server.AppState.from_app(a)
-            # 替换 http_client
-            await state.http_client.aclose()
-            transport = ASGITransport(app=fake_vllm_app)
-            state.http_client = AsyncClient(
-                transport=transport, base_url="http://fake-vllm"
-            )
-            state.default_backend_url = "http://fake-vllm"
-            yield
-
-    app.router.lifespan_context = patched_lifespan  # type: ignore[method-assign]
-    return app
+    server.set_test_backend(client_factory=_factory, backend_url="http://fake-vllm")
+    try:
+        yield server.create_app()
+    finally:
+        server.clear_test_backend()
 
 
 @pytest.fixture
 async def client(vllmonline_app: Any) -> AsyncIterator[AsyncClient]:
-    """vllmonline 自身的测试 client（通过 ASGITransport，零网络）。"""
-    transport = ASGITransport(app=vllmonline_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+    """vllmonline 自身的测试 client（通过 ASGITransport，零网络）。
+
+    用 asgi-lifespan 的 LifespanManager 显式驱动 FastAPI 的 lifespan 启动/关闭，
+    因为 httpx.ASGITransport 默认不发 lifespan 事件（app.state.vllmonline 不会被设置）。
+    """
+    from asgi_lifespan import LifespanManager
+
+    async with LifespanManager(vllmonline_app):
+        transport = ASGITransport(app=vllmonline_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +120,7 @@ async def sqlite_db(sqlite_engine):
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     # 导入所有 model 让 Base.metadata 注册（P2 实现后启用）
-    # from vllmonline.db.models import Base  # noqa: F401
+    # from vllmonline.db.models import Base
     # async with sqlite_engine.begin() as conn:
     #     await conn.run_sync(Base.metadata.create_all)
 

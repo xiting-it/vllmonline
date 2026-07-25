@@ -15,7 +15,7 @@ MI300X 部署注意事项：
 from __future__ import annotations
 
 import os
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class GpuBackend(str, Enum):
+class GpuBackend(StrEnum):
     """GPU 厂商栈。决定如何查询显存（rocm-smi vs nvidia-smi）。"""
 
     AUTO = "auto"  # 自动探测
@@ -241,6 +241,8 @@ def load_settings(
 ) -> Settings:
     """加载配置。
 
+    优先级（高到低）：显式 env_override > 真实环境变量 > YAML 文件 > 类内默认值。
+
     Args:
         config_path: YAML 文件路径。None 时读 VLLMONLINE_CONFIG 环境变量，
             再回退到默认 config.yaml。
@@ -252,20 +254,14 @@ def load_settings(
     if config_path is None:
         config_path = os.environ.get(ENV_CONFIG_FILE_VAR, DEFAULT_CONFIG_PATH)
 
-    yaml_data = _load_yaml_overrides(config_path)
-
-    # pydantic-settings 的环境变量扫描：如果传了 env_override，仅用那个；
-    # 否则用真实 os.environ。Settings() 自动读 env_prefix + nested delimiter。
+    # 三层合并：yaml_data 是基底，env 覆盖之，env_override 再覆盖
+    merged: dict[str, Any] = {}
+    merged.update(_load_yaml_overrides(config_path))
+    merged.update(_env_dict_to_nested(dict(os.environ)))
     if env_override is not None:
-        # 临时设置环境变量（最干净的方式是构造时传 _env，但 BaseSettings
-        # 通过 settings_customise_sources 支持复杂场景——这里用更简单的方式）
-        return Settings.model_validate({**yaml_data, **_env_dict_to_nested(env_override)})
+        merged.update(_env_dict_to_nested(env_override))
 
-    # 真实路径：先实例化（读 env），再用 yaml 覆盖（yaml 优先级低于 env，
-    # 所以反向：yaml 是默认值的扩展，env 仍可覆盖它）
-    settings = Settings.model_validate(yaml_data)
-    # 重新走一遍 env，让 env 覆盖 yaml
-    return Settings(settings.__dict__ | _env_dict_to_nested(dict(os.environ)))
+    return Settings.model_validate(merged)
 
 
 def _env_dict_to_nested(env: dict[str, str]) -> dict[str, Any]:

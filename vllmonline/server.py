@@ -38,18 +38,20 @@ from vllmonline.metrics import REGISTRY, init_metrics, record_proxy_request
 from vllmonline.version import __version__
 
 # hop-by-hop headers 不应被代理转发（RFC 7230 §6.1）
-_HOP_BY_HOP_HEADERS = frozenset({
-    "host",
-    "content-length",
-    "connection",
-    "transfer-encoding",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "upgrade",
-})
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "connection",
+        "transfer-encoding",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "upgrade",
+    }
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +75,8 @@ def _configure_logging(settings: Settings) -> structlog.BoundLogger:
     else:
         processors.append(structlog.dev.ConsoleRenderer(colors=True))
     structlog.configure(processors=processors)
-    return structlog.get_logger(settings.logging.service_name)
+    logger: structlog.BoundLogger = structlog.get_logger(settings.logging.service_name)
+    return logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +99,7 @@ class AppState:
 
     @classmethod
     def from_app(cls, app: FastAPI) -> AppState:
-        state: AppState = app.state.vllmonline  # type: ignore[attr-defined]
+        state: AppState = app.state.vllmonline
         return state
 
 
@@ -106,20 +109,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logger = _configure_logging(settings)
 
-    # 应用级 httpx 客户端（连接池复用）
-    http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=settings.vllm.connect_timeout_seconds,
-            read=settings.vllm.read_timeout_seconds,
-            write=10.0,
-            pool=5.0,
-        ),
-        limits=httpx.Limits(
-            max_connections=100,
-            max_keepalive_connections=20,
-        ),
-    )
-
     init_metrics(settings)
 
     # Phase 0：默认 backend 写死为环境变量或 localhost:8000。
@@ -128,16 +117,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     state = AppState()
     state.settings = settings
-    state.http_client = http_client
     state.logger = logger
     state.default_backend_url = default_backend
-    app.state.vllmonline = state  # type: ignore[attr-defined]
+
+    # 测试 hook：如果设置了 _test_client_factory，用它构造 http_client
+    # （指向 fake vLLM via ASGITransport，零网络）。生产路径不触发。
+    if _test_client_factory is not None:
+        http_client = _test_client_factory()
+        # 测试 fixture 可能同时想覆盖 backend URL
+        if _test_backend_url is not None:
+            state.default_backend_url = _test_backend_url
+    else:
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=settings.vllm.connect_timeout_seconds,
+                read=settings.vllm.read_timeout_seconds,
+                write=10.0,
+                pool=5.0,
+            ),
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+            ),
+        )
+    state.http_client = http_client
+    app.state.vllmonline = state
 
     logger.info(
         "vllmonline starting",
         version=__version__,
         environment=settings.environment,
-        backend=default_backend,
+        backend=state.default_backend_url,
         gpu_backend=settings.gpu.backend.value,
     )
 
@@ -148,14 +158,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("vllmonline stopped")
 
 
+# 测试 hook：单元测试通过 set_test_backend() 注入 fake vLLM。
+# 生产代码路径里这两个变量永远为 None。
+_test_client_factory: Any = None  # 类型：Callable[[], httpx.AsyncClient] | None
+_test_backend_url: str | None = None
+
+
+def set_test_backend(
+    client_factory: Any,
+    backend_url: str,
+) -> None:
+    """测试专用：注入 fake vLLM client 工厂。生产代码不要调用。"""
+    global _test_client_factory, _test_backend_url
+    _test_client_factory = client_factory
+    _test_backend_url = backend_url
+
+
+def clear_test_backend() -> None:
+    """测试结束清理。"""
+    global _test_client_factory, _test_backend_url
+    _test_client_factory = None
+    _test_backend_url = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app 工厂
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def create_app() -> FastAPI:
-    """构造 FastAPI 应用。"""
-    return FastAPI(
+    """构造 FastAPI 应用（含全部路由注册）。
+
+    测试和 uvicorn 入口都通过本函数拿 app，确保路由完整。
+    """
+    app = FastAPI(
         title="vLLMonline",
         description=(
             "vLLM 推理引擎上层管理平台：零停机模型热切换 + 灰度发布 + A/B 自动评测 + 劣化自动回滚。"
@@ -166,6 +202,26 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
         openapi_url="/openapi.json",
     )
+
+    # 注册 Phase 0 路由
+    app.add_api_route("/", root, methods=["GET"], tags=["meta"])
+    app.add_api_route("/healthz", healthz, methods=["GET"], tags=["meta"])
+    app.add_api_route("/readyz", readyz, methods=["GET"], tags=["meta"])
+    app.add_api_route("/metrics", metrics_endpoint, methods=["GET"], tags=["meta"])
+    app.add_api_route(
+        "/v1/chat/completions",
+        proxy_chat_completion,
+        methods=["POST"],
+        tags=["proxy"],
+        name="chat_completions",
+    )
+
+    # 后续 Phase 的路由通过 register_xxx_routes(app) 挂载
+    # P2: register_model_routes(app)
+    # P3: register_canary_routes(app)
+    # P4: register_eval_routes(app)
+
+    return app
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,22 +371,10 @@ async def _proxy_stream(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 构造 app 并注册路由
+# 模块级 app（uvicorn 入口：vllmonline.server:app）
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = create_app()
-
-app.add_api_route("/", root, methods=["GET"], tags=["meta"])
-app.add_api_route("/healthz", healthz, methods=["GET"], tags=["meta"])
-app.add_api_route("/readyz", readyz, methods=["GET"], tags=["meta"])
-app.add_api_route("/metrics", metrics_endpoint, methods=["GET"], tags=["meta"])
-app.add_api_route(
-    "/v1/chat/completions",
-    proxy_chat_completion,
-    methods=["POST"],
-    tags=["proxy"],
-    name="chat_completions",
-)
 
 
 def main() -> None:
