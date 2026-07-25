@@ -1,0 +1,207 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PEP 621 项目元数据
+# ─────────────────────────────────────────────────────────────────────────────
+[project]
+name = "vllmonline"
+version = "0.1.0"
+description = "vLLM 推理引擎上层管理平台：零停机模型热切换 + 灰度发布 + A/B 自动评测 + 劣化自动回滚"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "vLLMonline Contributors" }]
+keywords = ["vllm", "llm", "serving", "canary", "a-b-testing", "rocm", "mi300x"]
+
+# 运行时必需依赖（生产部署）
+# 版本范围参考 2026-07 调研结果，详见 DEVELOPMENT.md。
+dependencies = [
+    # Web 框架与 ASGI 服务器
+    "fastapi>=0.115,<0.150",
+    "uvicorn[standard]>=0.32,<0.60",
+    # HTTP 客户端（转发请求到 vLLM backend）
+    "httpx>=0.28,<0.29",  # 0.28 是 LTS 线，pin 小范围；测试用 ASGITransport
+    # Pydantic（FastAPI 数据校验）
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    # 数据库（SQLAlchemy 2.0 async + asyncpg）
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<0.40",
+    "alembic>=1.14,<2.0",  # migration（P5.2）
+    # SQLite async driver（开发期快测，免外部依赖）
+    "aiosqlite>=0.20,<0.60",
+    # Redis（路由表热更新 + metrics 缓存）
+    # 注意：redis-py 已升至 8.x（5.x/6.x 已过时或为另一商业包）
+    "redis>=8.0,<9.0",
+    # 可观测性
+    "prometheus-client>=0.21,<0.30",
+    # 重试
+    "tenacity>=9.0,<10",
+    # 统计检验
+    "scipy>=1.14,<2",
+    "numpy>=2.0,<3",
+    # YAML 配置文件解析
+    "pyyaml>=6.0,<7",
+    # 结构化日志
+    "structlog>=24.4,<26",
+]
+
+[project.optional-dependencies]
+# 可发布 extras（用户可选装）
+# 注：vllm 本体不在生产 deps 里——vllmonline 与 vLLM 通过 HTTP 通信，
+# 不需要 import vllm。仅当希望在 vllmonline 容器内本地起 vLLM 时才需要。
+gpu = [
+    # 实际部署时由 rocm/vllm 镜像提供 vLLM，这里不固定版本
+]
+
+[project.urls]
+Documentation = "https://github.com/gss/vllmonline/blob/main/README.md"
+Issues = "https://github.com/gss/vllmonline/issues"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PEP 735 依赖组（仅开发期，不进 wheel）
+# 2026 年新推荐写法，比把 dev 塞进 optional-dependencies 更干净。
+# ─────────────────────────────────────────────────────────────────────────────
+[dependency-groups]
+dev = [
+    "ruff>=0.8,<0.20",
+    "mypy>=1.13,<2",
+    "pre-commit>=4.0,<5",
+    "types-pyyaml>=6.0",
+]
+test = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.24,<0.30",
+    "pytest-cov>=6.0,<8",
+    "pytest-timeout>=2.3,<3",  # 防止卡死的集成测试
+    "respx>=0.21,<0.30",  # httpx 网络层 mock（纯单元测试用）
+    "testcontainers[postgres]>=4.7,<5",  # 集成测试用真实 PG 容器
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# uv 配置
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.uv]
+# 默认 dev + test 组都纳入开发环境
+default-groups = ["dev", "test"]
+# 锁定 Python 版本
+required-version = ">=0.11"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# hatchling 构建配置（让包可被 pip install -e .）
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.wheel]
+packages = ["vllmonline"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pytest
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+minversion = "8.3"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: 端到端集成测试（需要 Docker，用 testcontainers 起 PG）",
+    "slow: 较慢的测试（>1s）",
+]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=vllmonline",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-fail-under=85",  # 整体覆盖率门槛（SPEC 要求）
+    "--timeout=30",
+]
+filterwarnings = [
+    "error",
+    # 以下警告不视为错误（已知的、来自上游库的）
+    "ignore::DeprecationWarning:pytest_asyncio.*",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ruff（lint + format 二合一）
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["alembic/versions", "scripts/reports"]
+
+[tool.ruff.lint]
+# 规则集：
+# E/W = pycodestyle, F = pyflakes, I = isort, UP = pyupgrade,
+# B = bugbear, SIM = simplify, ASYNC = asyncio 常见坑, RUF = ruff 专属
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+ignore = [
+    "E501",  # 行长由 formatter 管
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ASYNC"]  # 测试里 ASYNC 误报多（同步 fixture 调 async）
+"tests/fake_vllm.py" = ["B008"]  # FastAPI 路由函数式定义
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mypy
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_decorators = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+# SQLAlchemy 2.0 typed，但 declarative 动态属性默认不被识别
+[[tool.mypy.overrides]]
+module = "vllmonline.db.models.*"
+disable_error_code = ["attr-defined"]
+
+# 第三方库缺 stub
+[[tool.mypy.overrides]]
+module = [
+    "scipy.*",
+    "scipy.stats.*",
+    "asyncpg.*",
+    "testcontainers.*",
+    "aiosqlite.*",
+]
+ignore_missing_imports = true
+
+# 测试放宽
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage 细分（各模块 SPEC 要求的覆盖率门槛）
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["vllmonline"]
+branch = true
+omit = [
+    "vllmonline/__init__.py",
+    "*/alembic/*",
+    "tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
