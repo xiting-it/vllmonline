@@ -29,6 +29,24 @@ os.environ.setdefault("VLLMONLINE_LOGGING__LEVEL", "WARNING")
 
 from tests.fake_vllm import make_fake_vllm_app
 
+
+# autouse：每个测试前清理全局单例，避免跨文件污染。
+# P2 起引入了多个模块级全局（routing_manager / registry / engine），
+# 不清理会让前一个测试的状态影响后一个。
+@pytest.fixture(autouse=True)
+def _reset_global_singletons() -> Any:
+    """重置所有模块级全局单例（autouse，每个测试自动跑）。"""
+    import vllmonline.api.routes as api_routes
+    import vllmonline.db.session as db_session
+    import vllmonline.router.proxy as proxy_mod
+
+    api_routes._global_registry = None  # type: ignore[attr-defined]
+    db_session._global_engine = None  # type: ignore[attr-defined]
+    db_session._global_session_factory = None  # type: ignore[attr-defined]
+    proxy_mod._global_routing_manager = None  # type: ignore[attr-defined]
+    yield
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fake vLLM backend
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,10 +96,7 @@ async def vllmonline_app(fake_vllm_app: Any) -> Any:
         yield server.create_app()
     finally:
         server.clear_test_backend()
-        # 清理全局单例（避免测试间状态污染）
-        import vllmonline.router.proxy as proxy_mod
-
-        proxy_mod._global_routing_manager = None  # type: ignore[attr-defined]
+        # 全局单例的清理由 autouse fixture _reset_global_singletons 统一负责
 
 
 @pytest.fixture

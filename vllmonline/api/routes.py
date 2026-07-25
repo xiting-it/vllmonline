@@ -16,6 +16,7 @@ P3/P4 的灰度/评测路由在各自 Phase 挂载。
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -24,11 +25,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from vllmonline.api.schemas import (
+    EvalCompareRequest,
     ModelListResponse,
     ModelRegisterRequest,
     ModelResponse,
 )
-from vllmonline.db.models import ModelVersion
+from vllmonline.db.models import EvalResult, ModelVersion
 from vllmonline.db.session import get_session
 from vllmonline.scheduler.gpu_memory import build_model_profile
 from vllmonline.scheduler.lifecycle import Model, ModelRegistry
@@ -315,3 +317,159 @@ def register_model_routes(app: object) -> None:
     """把模型管理路由挂到 FastAPI app 上。"""
     router = create_model_router()
     app.include_router(router)  # type: ignore[attr-defined]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 评测路由（P4，SPEC §8.2 评测部分）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def create_eval_router() -> APIRouter:
+    """构造评测路由。
+
+    POST /api/eval/compare   手动触发 A/B 对比
+    GET  /api/eval/{id}/report  获取评测报告（JSON）
+
+    注意：完整的 A/B 流程需要真实 LLM 调用（v1/v2/judge）。
+    本路由在单测里用 fake vLLM，生产用真实 backend。
+    """
+    router = APIRouter(prefix="/api/eval", tags=["eval"])
+
+    @router.post("/compare", status_code=status.HTTP_201_CREATED)
+    async def compare_models(
+        req: EvalCompareRequest,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        """触发 A/B 对比评测。
+
+        流程（SPEC §6.1）：
+            1. 对每个 prompt，双发到 v1 和 v2
+            2. Judge LLM 对比，三维度评分
+            3. 聚合所有样本做 Welch's t-test
+            4. 持久化结果到 eval_results 表
+        """
+        from vllmonline.eval.judge import (
+            ComparisonResult,
+            LLMJudge,
+            aggregate_evaluations,
+        )
+        from vllmonline.vllm.client import VLLMClient
+
+        registry = get_registry()
+        if req.model_v1 not in registry or req.model_v2 not in registry:
+            msg = f"模型 {req.model_v1} 或 {req.model_v2} 未注册"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+
+        m1 = registry.get(req.model_v1)
+        m2 = registry.get(req.model_v2)
+
+        # 用 judge_model（默认用 v1 当 judge——简化，生产应配独立 judge）
+        judge_model = req.judge_model or m1.model_name
+
+        # 构造 client + judge
+        client = VLLMClient()
+        try:
+            judge = LLMJudge(
+                client=client,
+                judge_endpoint=m1.endpoint,
+                judge_model=judge_model,
+            )
+
+            results: list[ComparisonResult] = []
+            for prompt in req.prompts:
+                try:
+                    result = await judge.evaluate_pair(
+                        user_prompt=prompt,
+                        v1_endpoint=m1.endpoint,
+                        v2_endpoint=m2.endpoint,
+                        model_v1=m1.model_name,
+                        model_v2=m2.model_name,
+                    )
+                    results.append(result)
+                except Exception as e:
+                    logger.warning(
+                        "judge failed for prompt",
+                        prompt=prompt[:50],
+                        error=str(e),
+                    )
+        finally:
+            await client.aclose()
+
+        if len(results) < 2:
+            msg = f"成功评测样本不足（{len(results)}），至少需要 2"
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+        # 聚合统计
+        aggregated = aggregate_evaluations(results)
+
+        # 持久化
+        import uuid
+
+        eval_id = f"eval-{uuid.uuid4().hex[:12]}"
+        row = EvalResult(
+            id=eval_id,
+            sample_count=aggregated.sample_count,
+            score_v1_mean=aggregated.score_v1_mean,
+            score_v2_mean=aggregated.score_v2_mean,
+            t_statistic=aggregated.t_test.t_statistic,
+            p_value=aggregated.t_test.p_value,
+            significant=aggregated.t_test.significant,
+            effect_size=aggregated.t_test.cohen_d,
+            dimension_scores={
+                "v1": aggregated.dimension_scores_v1,
+                "v2": aggregated.dimension_scores_v2,
+            },
+            recommendation=aggregated.t_test.recommendation,
+        )
+        session.add(row)
+        await session.commit()
+
+        logger.info(
+            "eval completed",
+            id=eval_id,
+            samples=aggregated.sample_count,
+            recommendation=aggregated.t_test.recommendation,
+            p_value=aggregated.t_test.p_value,
+        )
+
+        return {
+            "id": eval_id,
+            "sample_count": aggregated.sample_count,
+            "score_v1_mean": aggregated.score_v1_mean,
+            "score_v2_mean": aggregated.score_v2_mean,
+            "p_value": aggregated.t_test.p_value,
+            "significant": aggregated.t_test.significant,
+            "effect_size": aggregated.t_test.cohen_d,
+            "recommendation": aggregated.t_test.recommendation,
+        }
+
+    @router.get("/{eval_id}/report")
+    async def get_eval_report(
+        eval_id: str,
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        """获取评测报告（JSON）。"""
+        row = await session.get(EvalResult, eval_id)
+        if row is None:
+            msg = f"评测结果 {eval_id} 不存在"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        return {
+            "id": row.id,
+            "sample_count": row.sample_count,
+            "score_v1_mean": row.score_v1_mean,
+            "score_v2_mean": row.score_v2_mean,
+            "t_statistic": row.t_statistic,
+            "p_value": row.p_value,
+            "significant": row.significant,
+            "effect_size": row.effect_size,
+            "dimension_scores": row.dimension_scores,
+            "recommendation": row.recommendation,
+            "created_at": row.created_at.isoformat(),
+        }
+
+    return router
+
+
+def register_eval_routes(app: object) -> None:
+    """挂载评测路由。"""
+    app.include_router(create_eval_router())  # type: ignore[attr-defined]

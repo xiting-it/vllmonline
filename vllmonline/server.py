@@ -247,11 +247,11 @@ def create_app() -> FastAPI:
     )
 
     # Phase 2 起的业务路由
-    from vllmonline.api.routes import register_model_routes
+    from vllmonline.api.routes import register_eval_routes, register_model_routes
 
     register_model_routes(app)
     # P3: register_canary_routes(app)
-    # P4: register_eval_routes(app)
+    register_eval_routes(app)
 
     return app
 
