@@ -96,6 +96,10 @@ class AppState:
         self.logger: structlog.BoundLogger
         # 默认 vLLM backend（Phase 0 用；P3 起改为路由表查询）
         self.default_backend_url: str
+        # P2 起：模型注册表
+        from vllmonline.scheduler.lifecycle import ModelRegistry
+
+        self.registry: ModelRegistry
 
     @classmethod
     def from_app(cls, app: FastAPI) -> AppState:
@@ -143,18 +147,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.http_client = http_client
     app.state.vllmonline = state
 
+    # 初始化 DB engine + ModelRegistry（P2 起）
+    from vllmonline.api import routes as api_routes
+    from vllmonline.db import session as db_session
+    from vllmonline.scheduler.lifecycle import ModelRegistry
+
+    db_engine = db_session.create_engine(settings)
+    db_session.set_global_engine(db_engine)
+    # 开发/测试：直接建表（生产走 alembic upgrade head）
+    if settings.database.is_sqlite or settings.environment != "production":
+        await db_session.init_db(db_engine)
+
+    registry = ModelRegistry()
+    api_routes.set_global_registry(registry)
+    state.registry = registry
+
     logger.info(
         "vllmonline starting",
         version=__version__,
         environment=settings.environment,
         backend=state.default_backend_url,
         gpu_backend=settings.gpu.backend.value,
+        db_url=settings.database.url.split("@")[-1]
+        if "@" in settings.database.url
+        else settings.database.url,
     )
 
     try:
         yield
     finally:
         await http_client.aclose()
+        db_session.clear_global_engine()
+        await db_engine.dispose()
         logger.info("vllmonline stopped")
 
 
@@ -216,8 +240,10 @@ def create_app() -> FastAPI:
         name="chat_completions",
     )
 
-    # 后续 Phase 的路由通过 register_xxx_routes(app) 挂载
-    # P2: register_model_routes(app)
+    # Phase 2 起的业务路由
+    from vllmonline.api.routes import register_model_routes
+
+    register_model_routes(app)
     # P3: register_canary_routes(app)
     # P4: register_eval_routes(app)
 

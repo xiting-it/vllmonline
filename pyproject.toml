@@ -123,6 +123,8 @@ filterwarnings = [
     "error",
     # 以下警告不视为错误（已知的、来自上游库的）
     "ignore::DeprecationWarning:pytest_asyncio.*",
+    # SQLite 连接在测试 teardown 时的 __del__ 偶发警告（aiosqlite 上游问题）
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,6 +153,9 @@ ignore = [
     "RUF001",  # ambiguous unicode char in string
     "RUF002",  # ambiguous unicode char in docstring
     "RUF003",  # ambiguous unicode char in comment
+    # async 函数用 timeout 参数名是合理的公开 API 设计（SPEC/测试都依赖这个签名），
+    # ruff 建议改用 asyncio.timeout() 但那会破坏接口契约
+    "ASYNC109",
 ]
 
 [tool.ruff.lint.per-file-ignores]
