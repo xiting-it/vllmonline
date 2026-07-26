@@ -158,9 +158,9 @@ tmux attach -t vllmonline    # vllmonline 日志
 ## 架构
 
 ```
-                          ┌──────────────────────────────────────┐
+                           ┌──────────────────────────────────────┐
    Client ──HTTP──────────▶│  vllmonline Proxy (:8080)            │
-                           │  ├─ 路由决策（加权随机选版本）         │
+                           │  ├─ 路由决策（加权随机选版本）            │
                            │  ├─ 注入 header: x-model-version      │
                            │  ├─ 转发到 vLLM backend               │
                            │  └─ 采集 per-request metrics          │
