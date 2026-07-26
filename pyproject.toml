@@ -163,6 +163,8 @@ ignore = [
 "tests/fake_vllm.py" = ["B008"]  # FastAPI 路由函数式定义
 # FastAPI 项目里 Depends() / Field() 在默认参数是标准用法，不是 bug
 "vllmonline/server.py" = ["B008"]
+# 脚本里 async 函数末尾用 pathlib 写报告文件是合理的（一次性 IO，不影响 async 性能）
+"scripts/*" = ["ASYNC240"]
 "vllmonline/api/*" = ["B008"]
 
 [tool.ruff.format]
