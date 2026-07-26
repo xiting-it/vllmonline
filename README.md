@@ -89,6 +89,70 @@ open http://localhost:3000   # admin/admin
 
 完整 API 文档：启动后访问 `http://localhost:8080/docs`。
 
+### MI300X 单 Pod 部署（✅ 已实测跑通）
+
+适用于 K8s/PAI/DSW 等"GPU pod 内直连、无 Docker daemon"的场景。
+vLLM 与 vllmonline 作为同 pod 内的两个进程跑，DB 用 SQLite 文件。
+
+**前置**：pod 内已装 vLLM（`pip show vllm` 能看到 `0.20.1+rocm721`），`/dev/kfd` + `/dev/dri/` 可访问，`rocm-smi` 能看到 GPU。
+
+**一键启动**（启 3 个 tmux session：vLLM v1 + vLLM v2 + vllmonline）：
+
+```bash
+bash scripts/start_all.sh
+```
+
+脚本会：
+1. 用 tmux 后台起 vLLM v1（Qwen2.5-7B，端口 8000，30% 显存）
+2. 用 tmux 后台起 vLLM v2（Qwen2.5-1.5B，端口 8001，20% 显存）
+3. 等 vLLM 健康检查通过后起 vllmonline（端口 8080，SQLite 文件 DB）
+
+**一键停止**：
+
+```bash
+bash scripts/stop_all.sh
+```
+
+**手动注册模型**（启动后跑一次，配置存在 SQLite，重启 vllmonline 不丢）：
+
+```bash
+# 注册并加载 v1（baseline）
+curl -X POST http://localhost:8080/api/models/register \
+  -H "Content-Type: application/json" \
+  -d '{"model_name":"qwen-7b","version":"v1","endpoint":"http://localhost:8000","params_billion":7.0,"dtype":"fp16"}'
+curl -X POST http://localhost:8080/api/models/qwen-7b-v1/load
+
+# 注册并加载 v2（灰度候选）
+curl -X POST http://localhost:8080/api/models/register \
+  -H "Content-Type: application/json" \
+  -d '{"model_name":"qwen-7b","version":"v2","endpoint":"http://localhost:8001","params_billion":1.5,"dtype":"fp16"}'
+curl -X POST http://localhost:8080/api/models/qwen-7b-v2/load
+
+# 启动灰度（v2 占 10%）
+curl -X POST http://localhost:8080/api/canary/start \
+  -H "Content-Type: application/json" \
+  -d '{"model_v1":"qwen-7b-v1","model_v2":"qwen-7b-v2","stages":[0.1,0.3,1.0]}'
+```
+
+**查看日志**：
+
+```bash
+tmux attach -t vllm-v1       # v1 vLLM 日志（Ctrl+B D 退出）
+tmux attach -t vllm-v2       # v2 vLLM 日志
+tmux attach -t vllmonline    # vllmonline 日志
+```
+
+**实测验证结果**（MI300X 192GB，2026-07-26）：
+
+| 场景 | 结果 |
+|------|------|
+| v1 (7B) + v2 (1.5B) 同 GPU 共存 | ✅ 显存 97GB / 192GB（50%） |
+| 10% 灰度分流 20 请求 | ✅ v1:17 / v2:3（实测 85%/15%） |
+| 推进到 30% 灰度 | ✅ v2 流量占比上升 |
+| 手动回滚 | ✅ v2 自动 SLEEPING，后续流量 100% 回 v1 |
+| per-version metrics | ✅ `model_version="v1"/"v2"` label 正确区分 |
+| 状态机保护 | ✅ ACTIVE→LOADING 非法转移被拦截 |
+
 ---
 
 ## 架构

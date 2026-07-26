@@ -166,3 +166,42 @@ scope：phase 或模块名（如 `P1` / `gpu_memory` / `api`）
 
 - **`min_sample_size`**：SPEC §6.4 示例 d=0.5→64, d=0.2→394（用 Z≈1.96/0.84 近似）；实现用 scipy 精确分位数得 63/393。差异在 Z 值精度，数学上实现更准确。
 - **显存精度**：SPEC §3.4 说"保留 1 位小数"，实现保留完整精度（避免累积误差），1 位小数仅用于显示。
+
+## MI300X 单 Pod 部署实测（2026-07-26）
+
+在阿里云 PAI-DSW pod（K8s，无 Docker daemon，直连 MI300X）实测验证：
+
+### 环境
+
+| 项 | 值 |
+|---|---|
+| GPU | MI300X 192GB HBM3（gfx942） |
+| ROCm | 7.2.1 |
+| vLLM | 0.20.1+rocm721（pod 预装） |
+| PyTorch | 2.10.0 ROCm |
+| Python | 3.12（系统） |
+| 部署形态 | 单 pod 多进程（vLLM v1 + vLLM v2 + vllmonline），SQLite 文件 DB |
+
+### 关键决策与踩坑
+
+1. **模型下载**：HF 直连被墙，`hf-mirror.com` 也偶发 403。最终用 **ModelScope**（`snapshot_download`）下到 `/mnt/workspace/modelscope/`，vLLM 用本地路径启动。
+2. **`uv run uvicorn` 找不到模块**：DSW 的 `uv run` 默认用系统 Python，但 `uvicorn` CLI 不把 CWD 加 sys.path。解法：`PYTHONPATH=. python -m uvicorn vllmonline.server:app`。
+3. **SQLite in-memory 在生产重启丢数据**：改用文件 `sqlite+aiosqlite:////mnt/workspace/vllmonline/vllmonline.db`，pod 重启模型注册不丢。
+4. **同一 GPU 跑两个 vLLM**：v1 用 `--gpu-memory-utilization 0.30`，v2 用 `0.20`。实测占用 97GB / 192GB，留 95GB 余量。
+5. **curl 中文 reason 报 URL 格式错**：`/api/canary/{id}/rollback?reason=中文` 解析失败，改用 `--data-urlencode` 或英文 reason。
+
+### 实测结果
+
+- ✅ v1 (Qwen2.5-7B) + v2 (Qwen2.5-1.5B) 同 GPU 共存，显存 97GB / 192GB
+- ✅ 灰度 10% 分流：20 请求 → v1:17 / v2:3（统计误差内）
+- ✅ 推进 30%：v2 占比上升至 ~27%
+- ✅ 手动回滚：v2 自动 SLEEPING，后续 10 请求 100% 走 v1
+- ✅ per-version metrics：`model_version="v1"/"v2"` label 正确
+- ✅ 状态机保护：ACTIVE→LOADING 非法转移返回 409
+
+### 启停脚本
+
+```bash
+bash scripts/start_all.sh   # 启 3 个 tmux session（vllm-v1 / vllm-v2 / vllmonline）
+bash scripts/stop_all.sh    # 顺序停止 + 显示 GPU 显存释放
+```
