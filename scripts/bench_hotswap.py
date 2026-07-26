@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """热切换期间 source rate 压测：持续发请求 + 中途触发回滚，验证零请求丢失。
 
-用法（在 pod 里，vllmonline + 两个 vLLM 都跑着）：
+用法（在 pod 里）：
     cd /mnt/workspace/vllmonline
-    PYTHONPATH=. python scripts/bench_hotswap.py
-
-流程：
-    1. 先确保 v1 + v2 都 ACTIVE + 有一个进行中的灰度部署
-    2. 后台持续发请求（20 并发，30 秒，目标 QPS ~50）
-    3. 跑到 50% 时触发手动回滚
-    4. 结束后统计：总请求 / 成功 / 失败 / 实际 QPS / 回滚前后成功率对比
-
-输出：
-    - 终端实时进度
-    - 最终统计表格（截图用）
+    PYTHONPATH=. python scripts/bench_hotswap.py <deployment_id>
 """
 
 from __future__ import annotations
@@ -21,29 +11,14 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import httpx
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 配置
-# ─────────────────────────────────────────────────────────────────────────────
-
 VLLMONLINE_URL = "http://localhost:8080"
-DURATION_SECONDS = 30  # 总压测时长
-CONCURRENCY = 20  # 并发数
-ROLLBACK_AT_SECONDS = 15  # 第 15 秒触发回滚
-TARGET_QPS_INFO = "理论 QPS ≈ 并发数 × 单请求速度（vLLM 推理是瓶颈）"
-
-
-@dataclass
-class RequestResult:
-    sent_at: float
-    success: bool
-    latency_ms: float
-    model_version: str | None = None
-    error: str | None = None
+DURATION_SECONDS = 30
+CONCURRENCY = 20
+ROLLBACK_AT_SECONDS = 15
 
 
 @dataclass
@@ -52,36 +27,14 @@ class Stats:
     success: int = 0
     failed: int = 0
     latencies: list[float] = field(default_factory=list)
-    before_rollback: list[RequestResult] = field(default_factory=list)
-    after_rollback: list[RequestResult] = field(default_factory=list)
-    versions: dict[str, int] = field(default_factory=dict)
+    # 按"回滚前/后"分类（用绝对时间戳判断）
+    results: list[tuple[float, bool, float]] = field(
+        default_factory=list
+    )  # (sent_at, success, latency_ms)
 
 
-async def find_active_deployment(client: httpx.AsyncClient) -> str | None:
-    """找一个 IN_PROGRESS 的灰度部署。"""
-    # vllmonline 没有列出全部部署的 API，我们试着从已知 deployment 找
-    # 简化：让用户从命令行传，或者用最新的一个
-    return None  # 后面用环境变量或参数
-
-
-async def trigger_rollback(client: httpx.AsyncClient, deployment_id: str) -> bool:
-    """触发回滚。"""
-    try:
-        r = await client.post(
-            f"{VLLMONLINE_URL}/api/canary/{deployment_id}/rollback",
-            params={"reason": "benchmark_triggered_rollback"},
-            timeout=10.0,
-        )
-        return r.is_success
-    except Exception:
-        return False
-
-
-async def send_one_request(
-    client: httpx.AsyncClient,
-    prompt_id: int,
-) -> RequestResult:
-    """发一个请求，返回结果。"""
+async def send_one_request(client: httpx.AsyncClient, prompt_id: int) -> tuple[bool, float]:
+    """发一个请求，返回 (success, latency_ms)。"""
     t0 = time.monotonic()
     try:
         r = await client.post(
@@ -89,48 +42,54 @@ async def send_one_request(
             json={
                 "model": "qwen-7b",
                 "messages": [{"role": "user", "content": f"bench {prompt_id}"}],
-                "max_tokens": 10,
+                "max_tokens": 5,
                 "temperature": 0.0,
             },
             timeout=30.0,
         )
         latency = (time.monotonic() - t0) * 1000
-        if r.is_success:
-            return RequestResult(t0, True, latency)
-        return RequestResult(t0, False, latency, error=f"http_{r.status_code}")
-    except Exception as e:
+        return (r.is_success, latency)
+    except Exception:
         latency = (time.monotonic() - t0) * 1000
-        return RequestResult(t0, False, latency, error=type(e).__name__)
+        return (False, latency)
 
 
 async def worker(
     client: httpx.AsyncClient,
+    worker_id: int,
     stop_at: float,
-    prompt_counter: AsyncIterator[int],
-    stats: Stats,
     rollback_at: float,
+    stats: Stats,
+    counter: list[int],  # 共享计数器 [current_value]
 ) -> None:
-    async for pid in prompt_counter:
-        if time.monotonic() >= stop_at:
-            return
-        result = await send_one_request(client, pid)
+    """每个 worker 独立循环发请求，直到 stop_at。"""
+    while time.monotonic() < stop_at:
+        # 取一个唯一 prompt_id
+        pid = counter[0]
+        counter[0] += 1
+
+        sent_at = time.monotonic()
+        success, latency = await send_one_request(client, pid)
+
         stats.total += 1
-        if result.success:
+        if success:
             stats.success += 1
         else:
             stats.failed += 1
-        stats.latencies.append(result.latency)
-        if time.monotonic() < rollback_at:
-            stats.before_rollback.append(result)
-        else:
-            stats.after_rollback.append(result)
+        stats.latencies.append(latency)
+        stats.results.append((sent_at, success, latency))
 
 
-async def prompt_generator() -> AsyncIterator[int]:
-    n = 0
-    while True:
-        yield n
-        n += 1
+async def trigger_rollback(client: httpx.AsyncClient, deployment_id: str) -> bool:
+    try:
+        r = await client.post(
+            f"{VLLMONLINE_URL}/api/canary/{deployment_id}/rollback",
+            params={"reason": "benchmark_triggered"},
+            timeout=30.0,
+        )
+        return r.is_success
+    except Exception:
+        return False
 
 
 async def main(deployment_id: str | None = None) -> None:
@@ -139,21 +98,13 @@ async def main(deployment_id: str | None = None) -> None:
     print(
         f"  并发: {CONCURRENCY}   时长: {DURATION_SECONDS}s   回滚触发: 第 {ROLLBACK_AT_SECONDS}s"
     )
-    print(f"  {TARGET_QPS_INFO}")
     print("=" * 70)
-
-    if not deployment_id:
-        print("\n⚠ 未传 deployment_id，跳过自动回滚（仅压测，不触发切换）")
-        print("  用法: PYTHONPATH=. python scripts/bench_hotswap.py canary-xxxx")
-        print("  你可以从 /api/canary/start 的返回里拿到 id")
-        rollback_at = float("inf")
-    else:
-        print(f"\n✓ 将在第 {ROLLBACK_AT_SECONDS}s 回滚部署 {deployment_id}")
-        rollback_at = time.monotonic() + ROLLBACK_AT_SECONDS
 
     stats = Stats()
     start = time.monotonic()
     stop_at = start + DURATION_SECONDS
+    rollback_at = start + ROLLBACK_AT_SECONDS
+    counter = [0]  # 共享 prompt 计数器
 
     async with httpx.AsyncClient() as client:
         # 健康检查
@@ -168,19 +119,20 @@ async def main(deployment_id: str | None = None) -> None:
 
         print("\n开始压测...\n")
 
-        # 启动 workers
-        gen = prompt_generator()
+        # 启动 workers（每个独立循环）
         workers = [
-            asyncio.create_task(worker(client, stop_at, gen, stats, rollback_at))
-            for _ in range(CONCURRENCY)
+            asyncio.create_task(worker(client, i, stop_at, rollback_at, stats, counter))
+            for i in range(CONCURRENCY)
         ]
 
         # 后台触发回滚
         async def do_rollback():
             if deployment_id is None:
                 return
-            await asyncio.sleep(ROLLBACK_AT_SECONDS)
-            print(f"\n>>> [{ROLLBACK_AT_SECONDS}s] 触发回滚 <<<\n")
+            # 等到回滚时间点（轮询比 Event 简单）
+            while time.monotonic() < rollback_at:  # noqa: ASYNC110
+                await asyncio.sleep(0.1)
+            print(f"\n>>> [{ROLLBACK_AT_SECONDS}s] 触发回滚 <<<")
             ok = await trigger_rollback(client, deployment_id)
             print(f">>> 回滚结果: {'成功' if ok else '失败'} <<<\n")
 
@@ -194,23 +146,23 @@ async def main(deployment_id: str | None = None) -> None:
                 f"  [{elapsed:5.1f}s] 总请求={stats.total}  成功={stats.success}  失败={stats.failed}"
             )
 
-        # 停止
-        await rollback_task
+        # 停止 workers
         await asyncio.gather(*workers, return_exceptions=True)
+        await rollback_task
 
     # 统计
+    actual_duration = time.monotonic() - start
+    qps = stats.success / actual_duration if actual_duration > 0 else 0
+
+    sorted_lat = sorted(stats.latencies) if stats.latencies else [0]
+    avg_latency = sum(stats.latencies) / len(stats.latencies) if stats.latencies else 0
+    p50 = sorted_lat[len(sorted_lat) // 2] if sorted_lat else 0
+    p99 = sorted_lat[min(int(len(sorted_lat) * 0.99), len(sorted_lat) - 1)] if sorted_lat else 0
+
     print()
     print("=" * 70)
     print("压测结果")
     print("=" * 70)
-    actual_duration = time.monotonic() - start
-    qps = stats.success / actual_duration if actual_duration > 0 else 0
-
-    avg_latency = sum(stats.latencies) / len(stats.latencies) if stats.latencies else 0
-    sorted_lat = sorted(stats.latencies) if stats.latencies else [0]
-    p50 = sorted_lat[len(sorted_lat) // 2] if sorted_lat else 0
-    p99 = sorted_lat[int(len(sorted_lat) * 0.99)] if len(sorted_lat) > 1 else 0
-
     print(f"{'指标':<25} {'值':<20}")
     print("-" * 50)
     print(f"{'总请求数':<25} {stats.total:<20}")
@@ -223,16 +175,17 @@ async def main(deployment_id: str | None = None) -> None:
     print(f"{'P99 延迟 (ms)':<25} {p99:.1f}")
     print(f"{'压测时长 (s)':<25} {actual_duration:.1f}")
 
-    # 回滚前后对比（关键）
+    # 回滚前后对比
     if deployment_id:
+        before = [(s, ok, lat) for s, ok, lat in stats.results if s < rollback_at]
+        after = [(s, ok, lat) for s, ok, lat in stats.results if s >= rollback_at]
+        b_succ = sum(1 for _, ok, _ in before if ok)
+        a_succ = sum(1 for _, ok, _ in after if ok)
+
         print()
         print("=" * 70)
         print("回滚前后对比（验证零请求丢失）")
         print("=" * 70)
-        before = stats.before_rollback
-        after = stats.after_rollback
-        b_succ = sum(1 for r in before if r.success)
-        a_succ = sum(1 for r in after if r.success)
         print(f"{'阶段':<15} {'请求数':<10} {'成功':<10} {'失败':<10} {'成功率':<10}")
         print("-" * 55)
         print(
@@ -245,7 +198,7 @@ async def main(deployment_id: str | None = None) -> None:
         if stats.failed == 0:
             print("✓ 结论：热切换期间零请求丢失")
         else:
-            print(f"⚠ 结论：热切换期间丢失 {stats.failed} 个请求（需排查）")
+            print(f"⚠ 结论：热切换期间丢失 {stats.failed} 个请求")
 
     print()
     print("=" * 70)
