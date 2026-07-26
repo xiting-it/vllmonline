@@ -163,6 +163,69 @@ class TestRollbackExecutor:
         # m2 仍 IDLE
         assert m2.state is ModelState.IDLE
 
+    async def test_execute_rollback_v2_not_in_registry_force_db_sleeping(self) -> None:
+        """v2 不在内存 registry（进程重启场景）时，DB 状态必须强制改成 SLEEPING。
+
+        这是 2026-07-26 MI300X 实测发现的 bug：进程重启后内存 registry 空，
+        rollback 跳过 drain 分支，导致 /api/models 仍显示 ACTIVE，客户端误以为 v2 在服务。
+        修复：无论内存有没有 v2，都强制把 DB 状态标成 SLEEPING。
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        from vllmonline.db.models import Base, ModelVersion
+
+        # 建 in-memory SQLite + 表
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=__import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool,
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        # DB 里写一个 ACTIVE 的 v2（模拟进程重启前的状态）
+        async with Session() as session:
+            session.add(
+                ModelVersion(
+                    id="qwen-7b-v2",
+                    model_name="qwen-7b",
+                    version="v2",
+                    endpoint="http://x",
+                    params_billion=1.5,
+                    dtype="fp16",
+                    status="ACTIVE",
+                )
+            )
+            await session.commit()
+
+        # registry 是空的（不注册 v2）
+        registry = ModelRegistry()
+        routing = RoutingTableManager(registry)
+        executor = RollbackExecutor(registry, routing)
+
+        class _FakeDeployment:
+            id = "canary-test"
+            status = "IN_PROGRESS"
+
+        # 执行回滚（传 session）
+        async with Session() as session:
+            await executor.execute_rollback(
+                deployment=_FakeDeployment(),  # type: ignore[arg-type]
+                v1_id="qwen-7b-v1",
+                v2_id="qwen-7b-v2",
+                reason="v2 不在 registry",
+                session=session,
+            )
+
+        # 验证：DB 里 v2 状态必须被强制改成 SLEEPING
+        async with Session() as session:
+            row = await session.get(ModelVersion, "qwen-7b-v2")
+            assert row is not None
+            assert row.status == "SLEEPING", f"期望 SLEEPING，实际 {row.status}"
+
+        await engine.dispose()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # check_and_rollback 函数式 API

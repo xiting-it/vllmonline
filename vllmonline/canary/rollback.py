@@ -117,23 +117,36 @@ class RollbackExecutor:
         log = logger.bind(deployment=deployment.id, v1=v1_id, v2=v2_id)
         log.warning("rollback executing", reason=reason)
 
-        # 1. drain + sleep v2
-        if v2_id in self._registry:
+        # 1. drain + sleep v2（强制停止服务）
+        # 内存 registry 有就走完整 drain；没有也必须把 DB 状态标成 SLEEPING，
+        # 否则 /api/models 还会显示 ACTIVE，客户端误以为 v2 在服务。
+        v2_in_memory = v2_id in self._registry
+        if v2_in_memory:
             v2 = self._registry.get(v2_id)
             if v2.state is ModelState.ACTIVE:
                 from vllmonline.router.drain import drain_and_sleep
 
                 await drain_and_sleep(v2, timeout=30.0)
                 log.info("v2 drained and slept", model=v2_id)
-                # 同步 v2 状态到 DB
-                if session is not None:
-                    from vllmonline.db.models import ModelVersion
+        else:
+            log.warning(
+                "v2 not in memory registry, skipping drain (DB state will be force-set)",
+                model=v2_id,
+            )
 
-                    v2_row = await session.get(ModelVersion, v2_id)
-                    if v2_row is not None:
-                        v2_row.status = v2.state.value
-                        v2_row.state_changed_at = datetime.now(UTC)
-                        await session.commit()
+        # 无论内存有没有，都强制把 DB 状态改成 SLEEPING
+        if session is not None:
+            from vllmonline.db.models import ModelVersion
+
+            v2_row = await session.get(ModelVersion, v2_id)
+            if v2_row is not None:
+                # 如果内存有 v2，用内存的真实状态；否则强制 SLEEPING
+                new_state = v2.state.value if v2_in_memory else ModelState.SLEEPING.value
+                if v2_row.status != new_state:
+                    v2_row.status = new_state
+                    v2_row.state_changed_at = datetime.now(UTC)
+                    await session.commit()
+                    log.info("v2 DB status synced", model=v2_id, status=new_state)
 
         # 2. 流量 100% 切回 v1
         await self._routing.set_split({v1_id: 1.0, v2_id: 0.0})
