@@ -238,6 +238,53 @@ make test-cov          # 强制覆盖率检查（≥85%）
 
 ---
 
+## 验证脚本
+
+真实部署上跑的三个验证脚本（都在 `scripts/`）。详细输出样例见 [BLOG.md](BLOG.md)。
+
+| 脚本 | 用途 |
+|------|------|
+| `run_ab_eval.py` | A/B 评测：对比两个 vLLM 实例的模型，v1 当 judge 三维度评分（accuracy/completeness/safety） |
+| `bench_hotswap.py` | 热切换期间 source rate 压测：20 并发 30 秒，第 15 秒触发回滚，验证零请求丢失 |
+| `rollback_timeline.py` | 回滚时间线记录：50ms 高频轮询 v2 状态变化，输出毫秒级时间线 |
+
+**A/B 评测**（输出 t / p / Cohen's d / recommendation）：
+
+```bash
+PYTHONPATH=. python scripts/run_ab_eval.py
+# 报告保存到 scripts/reports/ab_eval_<timestamp>.md
+```
+
+**热切换期间 source rate 压测**（输出成功率 / QPS / P50 / P99 + 回滚前后对比）：
+
+```bash
+PYTHONPATH=. python scripts/bench_hotswap.py <deployment_id>
+```
+
+**回滚时间线记录**（输出：发起 → API 返回 → v2 SLEEPING → 流量切回）：
+
+```bash
+PYTHONPATH=. python scripts/rollback_timeline.py <deployment_id>
+```
+
+---
+
+## 实测数据
+
+MI300X 192GB 单 Pod 部署上的实测结果（2026-07-26）：
+
+| 实验 | 关键数据 | 结论 |
+|------|----------|------|
+| A/B 评测 | n=49, p=0.0001, d=-0.83 | ❌ v2 显著劣于 v1，建议 rollback |
+| 回滚时间线 | API 210ms 返回，321ms 流量全切 | ✅ 零停机回滚 |
+| source rate | 4640 请求 / 154 QPS / 100% 成功 | ✅ 热切换期间零请求丢失 |
+| 灰度分流 | 10% 配比实测 17:3（20 请求） | ✅ 加权路由正确 |
+| 状态机保护 | ACTIVE→LOADING 返回 409 | ✅ 非法转移被拦截 |
+
+完整复现步骤与原始日志见 [BLOG.md](BLOG.md)。
+
+---
+
 ## 配置
 
 配置来源（优先级高到低）：环境变量 > YAML 文件 > 默认值。

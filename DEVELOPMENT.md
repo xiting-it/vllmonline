@@ -167,6 +167,52 @@ scope：phase 或模块名（如 `P1` / `gpu_memory` / `api`）
 - **`min_sample_size`**：SPEC §6.4 示例 d=0.5→64, d=0.2→394（用 Z≈1.96/0.84 近似）；实现用 scipy 精确分位数得 63/393。差异在 Z 值精度，数学上实现更准确。
 - **显存精度**：SPEC §3.4 说"保留 1 位小数"，实现保留完整精度（避免累积误差），1 位小数仅用于显示。
 
+### 实测发现的 bug
+
+#### Bug：rollback 时 v2 不在内存 registry，导致状态不同步
+
+**现象**
+
+MI300X pod 上实测回滚时间线时，rollback API 返回 200，但随后 `/api/models` 仍显示 v2 为 ACTIVE（预期应为 SLEEPING）。DB 与内存状态不一致。
+
+**根因**
+
+进程重启后内存 `ModelRegistry` 为空，但 DB 仍有数据。`RollbackExecutor` 走 `if v2_id in self._registry` 分支时跳过了 drain+sleep，导致 DB 状态没更新。
+
+更深层问题：`/api/models` 读 DB（返回 ACTIVE），`/api/canary/start` 读内存 registry（返回 404）——两个 API 对同一 model 表现不一致，排查时极易误判。
+
+**修复**
+
+- 无论内存 registry 是否有 v2，强制把 DB 状态标成 SLEEPING
+- 新增单测 `test_execute_rollback_v2_not_in_registry_force_db_sleeping` 复现此场景，防止回归
+
+**根本解法（待做）**
+
+vllmonline 启动时从 DB 重建内存 registry，保证两者一致。
+
+**教训**
+
+内存状态 + DB 状态的双写场景，必须有"启动时从 DB 恢复内存"的逻辑，否则进程重启后两者必然漂移。临时修复只能补一处漏，治本得把重建逻辑补上。
+
+### A/B 评测的样本量陷阱
+
+**陷阱：小样本下 t-test 可能不显著，即使效应量大**
+
+**实测数据**
+
+| 样本量 | p-value | Cohen's d | t-test 结论 |
+|--------|---------|-----------|-------------|
+| n=5 | 0.1361 | -1.12（大效应） | 不显著 |
+| n=49 | 0.0001 | -0.83（大效应） | 极显著 |
+
+**原因**
+
+t-test 的显著性同时依赖效应量与样本量。SPEC §6.4 的 `min_sample_size(d=0.8) ≈ 26` 就是这个门槛。n=5 虽然效应量更大（d=-1.12），但因样本太少，t-test 仍判"证据不足"。
+
+**教训**
+
+灰度策略中 `should_advance` 的"最小样本量"检查（条件 1）是必要的，不能为了快而跳过。即使肉眼可见 v2 更差，样本不够时 t-test 仍会说"证据不足"——这正是该检查存在的意义。
+
 ## MI300X 单 Pod 部署实测（2026-07-26）
 
 在阿里云 PAI-DSW pod（K8s，无 Docker daemon，直连 MI300X）实测验证：
@@ -198,6 +244,22 @@ scope：phase 或模块名（如 `P1` / `gpu_memory` / `api`）
 - ✅ 手动回滚：v2 自动 SLEEPING，后续 10 请求 100% 走 v1
 - ✅ per-version metrics：`model_version="v1"/"v2"` label 正确
 - ✅ 状态机保护：ACTIVE→LOADING 非法转移返回 409
+
+### 验证脚本与量化结果
+
+三个实测脚本（均在 `scripts/`）：
+
+| 脚本 | 用途 | 配置 |
+|------|------|------|
+| `run_ab_eval.py` | A/B 评测 | 49 prompt × 三维度评分 × t-test |
+| `bench_hotswap.py` | 热切换 source rate 压测 | 20 并发 × 30s × 第 15s 回滚 |
+| `rollback_timeline.py` | 回滚时间线探测 | 50ms 轮询状态变化 |
+
+量化结果：
+
+- **A/B 评测**：p=0.0001, Cohen's d=-0.83, recommendation=rollback
+- **热切换 source rate**：4640 请求 / 154 QPS / 100% 成功率 / 零丢失
+- **回滚时间线**：API 响应 210ms，流量切回 321ms
 
 ### 启停脚本
 
