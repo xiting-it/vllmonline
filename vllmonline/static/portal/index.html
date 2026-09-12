@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vLLMonline · 灰度发布演示</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ═══════════════════════ 1. HERO ═══════════════════════ -->
+<header class="hero">
+    <div class="hero-inner">
+        <h1>vLLMonline <span class="hero-sub">vLLM 零停机灰度发布平台</span></h1>
+        <p class="hero-desc">同一张 GPU 上运行两个模型版本 · 统计驱动的灰度放量 · 一键回滚仅 321ms · 客户端全程无感知</p>
+
+        <div class="flow">
+            <div class="flow-step">
+                <div class="flow-icon">⚡</div>
+                <div class="flow-title">双模型同 GPU</div>
+                <div class="flow-desc">v1 与 v2 并存<br>共享 192GB HBM3</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step">
+                <div class="flow-icon">📊</div>
+                <div class="flow-title">10% 灰度 + 评测</div>
+                <div class="flow-desc">加权分流<br>Welch's t-test 判定</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step">
+                <div class="flow-icon">🔄</div>
+                <div class="flow-title">达标放量 / 劣化回滚</div>
+                <div class="flow-desc">p&lt;0.05 推进<br>劣化 321ms 切回</div>
+            </div>
+        </div>
+
+        <div class="status-badges">
+            <span class="badge" id="badge-platform"><span class="dot"></span>vllmonline</span>
+            <span class="badge" id="badge-v1"><span class="dot"></span>vLLM v1</span>
+            <span class="badge" id="badge-v2"><span class="dot"></span>vLLM v2</span>
+        </div>
+    </div>
+</header>
+
+<main class="container">
+
+<!-- ═══════════════════════ 2. 模型管理 ═══════════════════════ -->
+<section class="panel" id="panel-models">
+    <h2><span class="panel-num">01</span> 模型管理</h2>
+    <p class="panel-desc">同一 GPU 上的模型版本。状态机保证操作安全——非法转移（如 ACTIVE→LOADING）会被拒绝。</p>
+    <div class="model-grid" id="model-grid">
+        <div class="empty-hint">加载中…</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════ 3. 灰度控制台 ═══════════════════════ -->
+<section class="panel" id="panel-canary">
+    <h2><span class="panel-num">02</span> 灰度控制台 <span class="demo-tag">演示核心</span></h2>
+    <p class="panel-desc">点击按钮体验零停机灰度：<b>启动灰度</b>→流量按比例分流→<b>推进</b>到下一阶段→<b>回滚</b>瞬间切回 v1。</p>
+
+    <div class="canary-controls">
+        <button class="btn btn-green" id="btn-start-canary">▶ 启动灰度（10%）</button>
+        <button class="btn btn-blue" id="btn-advance" disabled>⏩ 推进到下一阶段</button>
+        <button class="btn btn-red" id="btn-rollback" disabled>⟲ 回滚到 v1</button>
+        <button class="btn btn-ghost" id="btn-send-traffic">🔥 发送 20 个测试请求</button>
+    </div>
+
+    <div class="canary-layout">
+        <div class="canary-left">
+            <h3>流量配比（每 2 秒刷新）</h3>
+            <div class="chart-box pie-box"><canvas id="chart-split"></canvas></div>
+        </div>
+        <div class="canary-right">
+            <h3>阶段进度</h3>
+            <div class="stage-bar" id="stage-bar">
+                <div class="stage" data-stage="INIT">INIT</div>
+                <div class="stage" data-stage="STAGE_10%">10%</div>
+                <div class="stage" data-stage="STAGE_30%">30%</div>
+                <div class="stage" data-stage="STAGE_100%">100%</div>
+                <div class="stage" data-stage="COMPLETED">完成</div>
+            </div>
+            <h3 style="margin-top:24px">当前部署</h3>
+            <div class="deploy-info" id="deploy-info">
+                <div class="empty-hint">暂无进行中的灰度部署<br>点击上方「启动灰度」开始演示</div>
+            </div>
+        </div>
+    </div>
+
+    <h3>部署历史</h3>
+    <table class="table" id="table-canary">
+        <thead><tr><th>部署 ID</th><th>v1</th><th>v2</th><th>状态</th><th>当前配比</th><th>开始时间</th></tr></thead>
+        <tbody></tbody>
+    </table>
+</section>
+
+<!-- ═══════════════════════ 4. 实时监控 ═══════════════════════ -->
+<section class="panel" id="panel-metrics">
+    <h2><span class="panel-num">03</span> 实时监控 <span class="live-tag">● LIVE</span></h2>
+    <p class="panel-desc">Per-version metrics：v1 与 v2 在同一维度对比。回滚后 v2 曲线将冻结。</p>
+
+    <div class="metrics-layout">
+        <div class="metrics-main">
+            <h3>累计请求数（v1 vs v2）</h3>
+            <div class="chart-box line-box"><canvas id="chart-requests"></canvas></div>
+        </div>
+        <div class="metrics-side">
+            <div class="stat-card">
+                <div class="stat-label">v1 成功请求</div>
+                <div class="stat-value" id="stat-v1-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">v2 成功请求</div>
+                <div class="stat-value" id="stat-v2-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">v2 错误</div>
+                <div class="stat-value" id="stat-v2-errors">0</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════ 5. A/B 评测 ═══════════════════════ -->
+<section class="panel" id="panel-eval">
+    <h2><span class="panel-num">04</span> A/B 评测（LLM-as-Judge + Welch's t-test）</h2>
+    <p class="panel-desc">Judge 从 accuracy / completeness / safety 三维度对比两版本回答，t-test 判定差异是否显著。<br>
+    <b>触发评测需在终端运行：</b><code>PYTHONPATH=. python scripts/run_ab_eval.py</code>（评测走独立脚本以保证 judge 质量）</p>
+
+    <div class="eval-stats" id="eval-stats">
+        <div class="empty-hint">暂无评测记录</div>
+    </div>
+
+    <div class="eval-layout" id="eval-detail" style="display:none">
+        <div class="eval-left">
+            <h3>三维度均分对比</h3>
+            <div class="chart-box bar-box"><canvas id="chart-dims"></canvas></div>
+        </div>
+        <div class="eval-right">
+            <h3>结论解读</h3>
+            <div class="eval-verdict" id="eval-verdict"></div>
+        </div>
+    </div>
+
+    <h3>评测历史</h3>
+    <table class="table" id="table-eval">
+        <thead><tr><th>评测 ID</th><th>样本量</th><th>v1 均分</th><th>v2 均分</th><th>p 值</th><th>显著?</th><th>结论</th><th>时间</th></tr></thead>
+        <tbody></tbody>
+    </table>
+</section>
+
+</main>
+
+<footer class="footer">
+    vLLMonline 演示门户 · API 文档 <a href="/docs" target="_blank">/docs</a> · 指标 <a href="/metrics" target="_blank">/metrics</a>
+</footer>
+
+<script src="chart.umd.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -328,6 +328,7 @@ def register_model_routes(app: object) -> None:
 def create_eval_router() -> APIRouter:
     """构造评测路由。
 
+    GET  /api/eval               列出所有评测（门户用）
     POST /api/eval/compare   手动触发 A/B 对比
     GET  /api/eval/{id}/report  获取评测报告（JSON）
 
@@ -335,6 +336,33 @@ def create_eval_router() -> APIRouter:
     本路由在单测里用 fake vLLM，生产用真实 backend。
     """
     router = APIRouter(prefix="/api/eval", tags=["eval"])
+
+    @router.get("")
+    async def list_evals(
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        """列出所有评测结果（门户用，按时间倒序）。"""
+        stmt = select(EvalResult).order_by(EvalResult.created_at.desc())
+        result = await session.execute(stmt)
+        rows = list(result.scalars().all())
+        return {
+            "evals": [
+                {
+                    "id": r.id,
+                    "sample_count": r.sample_count,
+                    "score_v1_mean": r.score_v1_mean,
+                    "score_v2_mean": r.score_v2_mean,
+                    "p_value": r.p_value,
+                    "significant": r.significant,
+                    "effect_size": r.effect_size,
+                    "recommendation": r.recommendation,
+                    "dimension_scores": r.dimension_scores,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ],
+            "total": len(rows),
+        }
 
     @router.post("/compare", status_code=status.HTTP_201_CREATED)
     async def compare_models(
@@ -484,6 +512,32 @@ def register_eval_routes(app: object) -> None:
 def create_canary_router() -> APIRouter:
     """构造灰度管理路由（start/status/advance/rollback/metrics）。"""
     router = APIRouter(prefix="/api/canary", tags=["canary"])
+
+    @router.get("")
+    async def list_canaries(
+        session: AsyncSession = Depends(get_session),
+    ) -> dict[str, Any]:
+        """列出所有灰度部署（门户用，按开始时间倒序）。"""
+        stmt = select(CanaryDeployment).order_by(CanaryDeployment.started_at.desc())
+        result = await session.execute(stmt)
+        rows = list(result.scalars().all())
+        return {
+            "deployments": [
+                {
+                    "id": r.id,
+                    "model_v1_id": r.model_v1_id,
+                    "model_v2_id": r.model_v2_id,
+                    "strategy": r.strategy,
+                    "stages": r.stages,
+                    "current_stage_index": r.current_stage_index,
+                    "traffic_split": r.traffic_split or {},
+                    "status": r.status,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                }
+                for r in rows
+            ],
+            "total": len(rows),
+        }
 
     @router.post("/start", status_code=status.HTTP_201_CREATED)
     async def start_canary(

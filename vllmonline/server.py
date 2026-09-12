@@ -257,6 +257,15 @@ def create_app() -> FastAPI:
     register_canary_routes(app)
     register_eval_routes(app)
 
+    # 演示门户：静态文件挂载到 /portal（html=True 使 /portal 直接返回 index.html）
+    from pathlib import Path
+
+    from fastapi.staticfiles import StaticFiles
+
+    portal_dir = Path(__file__).parent / "static" / "portal"
+    if portal_dir.is_dir():
+        app.mount("/portal", StaticFiles(directory=str(portal_dir), html=True), name="portal")
+
     return app
 
 
