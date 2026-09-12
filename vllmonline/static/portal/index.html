@@ -55,7 +55,7 @@
 
 <!-- ═══════════════════════ 3. 灰度控制台 ═══════════════════════ -->
 <section class="panel" id="panel-canary">
-    <h2><span class="panel-num">02</span> 灰度控制台 <span class="demo-tag">演示核心</span></h2>
+    <h2><span class="panel-num">02</span> 灰度控制台 <span class="demo-tag">演示核心</span><span class="snapshot-tag" id="canary-source" hidden title="数据库为空，展示 MI300X 真实运行结果（详见 BLOG.md §六）。启动新灰度后自动切换为实时数据">⬗ MI300X 实测快照</span></h2>
     <p class="panel-desc">点击按钮体验零停机灰度：<b>启动灰度</b>→流量按比例分流→<b>推进</b>到下一阶段→<b>回滚</b>瞬间切回 v1。</p>
 
     <div class="canary-controls">
@@ -122,7 +122,7 @@
 
 <!-- ═══════════════════════ 5. A/B 评测 ═══════════════════════ -->
 <section class="panel" id="panel-eval">
-    <h2><span class="panel-num">04</span> A/B 评测（LLM-as-Judge + Welch's t-test）</h2>
+    <h2><span class="panel-num">04</span> A/B 评测（LLM-as-Judge + Welch's t-test）<span class="snapshot-tag" id="eval-source" hidden title="数据库为空，展示 MI300X 真实运行结果（n=49，详见 BLOG.md §七）。重跑 scripts/run_ab_eval.py 后自动切换为实时数据">⬗ MI300X 实测快照</span></h2>
     <p class="panel-desc">Judge 从 accuracy / completeness / safety 三维度对比两版本回答，t-test 判定差异是否显著。<br>
     <b>触发评测需在终端运行：</b><code>PYTHONPATH=. python scripts/run_ab_eval.py</code>（评测走独立脚本以保证 judge 质量）</p>
 

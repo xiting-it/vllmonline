@@ -17,6 +17,38 @@ const MAX_POINTS = 120; // 折线图最多保留的点数（2s × 120 = 4 分钟
 
 const COLORS = { v1: "#3498db", v2: "#e67e22" };
 
+/* MI300X 实测快照（Qwen2.5-7B vs Qwen2.5-1.5B，AMD MI300X 192GB 单卡）
+ * 数据库为空时回填展示；字段结构与 GET /api/eval、GET /api/canary 响应一致。
+ * 数据来源：scripts/run_ab_eval.py 真实运行结果（BLOG.md §七 / README 实测数据）。
+ */
+const EVAL_SNAPSHOT = {
+    id: "mi300x-ab-n49",
+    sample_count: 49,
+    score_v1_mean: 0.9207,
+    score_v2_mean: 0.8578,
+    p_value: 0.0001,
+    significant: true,
+    effect_size: -0.8315,
+    recommendation: "rollback",
+    dimension_scores: {
+        v1: { accuracy: 0.8765, completeness: 0.8857, safety: 1.0 },
+        v2: { accuracy: 0.7816, completeness: 0.7918, safety: 1.0 },
+    },
+    created_at: "2026-09-11",
+};
+
+const CANARY_SNAPSHOT = {
+    id: "canary-9543394eec75",
+    model_v1_id: "qwen-7b-v1",
+    model_v2_id: "qwen-7b-v2",
+    strategy: "gray",
+    stages: [0.1, 0.3, 1.0],
+    current_stage_index: 1,
+    traffic_split: { "qwen-7b-v1": 0.7, "qwen-7b-v2": 0.3 },
+    status: "ROLLED_BACK",
+    started_at: "2026-09-11",
+};
+
 // ── 全局状态 ─────────────────────────────
 let splitChart = null;      // 流量配比环形图
 let requestsChart = null;   // 请求数折线图
@@ -128,12 +160,17 @@ async function refreshCanary() {
     const data = await fetchJSON(API.canaries);
     const tbody = $("#table-canary tbody");
 
+    // 数据库为空时回填实测快照（仅进历史表，不参与按钮/活跃部署逻辑）
+    let deployments = data.deployments || [];
+    $("#canary-source").hidden = deployments.length > 0;
+    if (!deployments.length) deployments = [CANARY_SNAPSHOT];
+
     // 找进行中的部署
-    activeDeploy = data.deployments?.find((d) => d.status === "IN_PROGRESS") || null;
+    activeDeploy = deployments.find((d) => d.status === "IN_PROGRESS") || null;
     updateCanaryButtons();
 
     // 部署历史表
-    tbody.innerHTML = (data.deployments || []).map((d) => {
+    tbody.innerHTML = deployments.map((d) => {
         const split = Object.entries(d.traffic_split || {})
             .map(([k, v]) => `${k.split("-").pop()}:${(v * 100).toFixed(0)}%`).join(" / ");
         return `<tr>
@@ -373,7 +410,10 @@ function renderRequestsChart() {
 // ── A/B 评测面板 ─────────────────────────
 async function refreshEvals() {
     const data = await fetchJSON(API.evals);
-    const list = data.evals || [];
+    // 数据库为空时回填实测快照（面板顶部显示来源标签）
+    let list = data.evals || [];
+    $("#eval-source").hidden = list.length > 0;
+    if (!list.length) list = [EVAL_SNAPSHOT];
     const tbody = $("#table-eval tbody");
 
     tbody.innerHTML = list.map((e) => {

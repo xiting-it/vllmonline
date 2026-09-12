@@ -92,6 +92,11 @@ body {
     padding: 2px 9px; border-radius: 999px; font-weight: 500;
     animation: pulse 1.6s infinite;
 }
+.snapshot-tag {
+    font-size: 11px; color: #9aa7bd; border: 1px dashed rgba(154, 167, 189, 0.5);
+    padding: 2px 9px; border-radius: 999px; font-weight: 500; margin-left: 4px;
+}
+.snapshot-tag[title] { cursor: help; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
 
 /* ── 模型卡片 ─────────────────────────── */
